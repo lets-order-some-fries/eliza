@@ -11,6 +11,7 @@ import type { Media } from "@elizaos/core";
 import {
   type Content,
   createUniqueUuid,
+  ElizaError,
   fetchWithSsrfGuard,
   logger,
   type Memory,
@@ -187,15 +188,13 @@ export async function sendTweet(
   tweetToReplyTo?: string,
   mediaIds?: string[],
 ): Promise<SentTweet> {
-  const isNoteTweet = text.length > TWEET_MAX_LENGTH;
-  const postText = isNoteTweet
-    ? truncateToCompleteSentence(text, TWEET_MAX_LENGTH)
-    : text;
+  return client.withAuthenticatedSession(async ({ profile }) => {
+    const isNoteTweet = text.length > TWEET_MAX_LENGTH;
+    const postText = isNoteTweet
+      ? truncateToCompleteSentence(text, TWEET_MAX_LENGTH)
+      : text;
 
-  let result: SendTweetResponse;
-
-  try {
-    result = await client.twitterClient.sendTweet(
+    const result: SendTweetResponse = await client.twitterClient.sendTweet(
       postText,
       tweetToReplyTo,
       mediaData,
@@ -203,51 +202,45 @@ export async function sendTweet(
       mediaIds,
     );
     logger.info("Successfully posted Tweet");
-  } catch (error) {
-    logger.error("Error posting Tweet:", errorDetail(error));
-    throw error;
-  }
 
-  const tweetResult = unwrapSentTweet(result);
-  if (!tweetResult) {
-    logger.error("No valid response from Twitter API");
-    throw new Error("Failed to send tweet - no valid response");
-  }
-
-  try {
-    if (
-      client.lastCheckedTweetId === null ||
-      client.lastCheckedTweetId < BigInt(tweetResult.id)
-    ) {
-      client.lastCheckedTweetId = BigInt(tweetResult.id);
+    const tweetResult = unwrapSentTweet(result);
+    if (!tweetResult) {
+      throw new ElizaError("X returned no usable post receipt", {
+        code: "X_POST_RESPONSE_INVALID",
+      });
     }
-    await client.cacheLatestCheckedTweetId();
 
-    await client.cacheTweet({
-      ...tweetResult,
-      userId: "",
-      username: "",
-      name: "",
-      conversationId: tweetResult.id,
-      timestamp: Date.now(),
-      photos: [],
-      mentions: [],
-      hashtags: [],
-      urls: [],
-      videos: [],
-      thread: [],
-      permanentUrl: "",
-    });
+    try {
+      client.recordLatestCheckedTweetId(profile.id, BigInt(tweetResult.id));
+      await client.cacheLatestCheckedTweetId(profile);
+      await client.cacheTweet({
+        ...tweetResult,
+        userId: profile.id,
+        username: profile.username,
+        name: profile.screenName,
+        conversationId: tweetResult.id,
+        timestamp: Date.now(),
+        photos: [],
+        mentions: [],
+        hashtags: [],
+        urls: [],
+        videos: [],
+        thread: [],
+        permanentUrl: `https://x.com/${profile.username}/status/${tweetResult.id}`,
+      });
+      logger.info("Successfully posted a tweet", tweetResult.id);
+    } catch (error) {
+      // error-policy:J7 X already accepted the post, so retrying would duplicate
+      // an external effect. Surface the local receipt failure and return the
+      // accepted provider result exactly once.
+      client.runtime.reportError("X.sendTweet.localReceipt", error, {
+        accountId: client.accountId,
+        tweetId: tweetResult.id,
+      });
+    }
 
-    logger.info("Successfully posted a tweet", tweetResult.id);
-  } catch (error) {
-    logger.error(
-      "Tweet posted, but failed to update local tweet cache:",
-      errorDetail(error),
-    );
-  }
-
-  return tweetResult;
+    return tweetResult;
+  });
 }
 
 /**

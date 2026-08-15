@@ -1,10 +1,7 @@
 /**
- * `ClientBase` — the per-account X/Twitter transport core shared by the plugin's
- * autonomous loops (post, interaction, timeline, discovery) and by the connector
- * handlers on `XService`. Authenticates a twitter-api-v2 `Client` through the
- * resolved auth provider (OAuth 1.0a env-mode or OAuth 2.0 PKCE), caches the
- * agent's own `TwitterProfile`, and fetches home/following timelines, tweets, and
- * search results.
+ * Per-account X transport core shared by autonomous loops and connector handlers.
+ * It authenticates through the selected provider, keeps the public compatibility
+ * profile synchronized with the credential-aware client, and owns timeline state.
  *
  * On `init` it also seeds the runtime with `FEED` rooms and message memories for
  * recent timeline + mention tweets, and tracks the last-checked tweet id (via the
@@ -16,12 +13,14 @@ import {
   ChannelType,
   type Content,
   createUniqueUuid,
+  ElizaError,
   type IAgentRuntime,
   logger,
   type Memory,
   type State,
   type UUID,
 } from "@elizaos/core";
+import type { TwitterApi } from "twitter-api-v2";
 import {
   resolveRequestedXAccountId,
   resolveTwitterAccountConfig,
@@ -73,6 +72,12 @@ export type TwitterProfile = {
   screenName: string;
   bio: string;
   nicknames: string[];
+};
+
+export type TwitterAccountSession = {
+  client: TwitterApi;
+  profile: TwitterProfile;
+  revision: number;
 };
 
 /**
@@ -237,6 +242,7 @@ export class ClientBase {
    */
   accountId = "default";
   lastCheckedTweetId: bigint | null = null;
+  private lastCheckedTweetProfileId: string | null = null;
   temperature = 0.5;
 
   requestQueue: RequestQueue = new RequestQueue();
@@ -324,11 +330,119 @@ export class ClientBase {
     this.twitterClient = new Client();
   }
 
-  private requireProfile(): TwitterProfile {
-    if (!this.profile) {
-      throw new Error("Twitter profile has not been initialized");
+  private async synchronizeAuthenticatedSession(
+    session: Awaited<ReturnType<Client["getAuthenticatedSession"]>>,
+  ): Promise<TwitterAccountSession> {
+    const profile = session.profile;
+    if (!profile.userId || !profile.username) {
+      throw new ElizaError(
+        "Authenticated Twitter profile is missing id or username",
+        { code: "X_PROFILE_INVALID" },
+      );
     }
-    return this.profile;
+
+    const nextProfile: TwitterProfile = {
+      id: profile.userId,
+      username: profile.username,
+      screenName: profile.name ?? profile.username,
+      bio: profile.biography || "",
+      nicknames: resolveAgentNicknames(this.runtime, {
+        username: profile.username,
+        screenName: profile.name ?? profile.username,
+      }),
+    };
+    const identityChanged =
+      this.profile?.id !== nextProfile.id ||
+      this.profile.username !== nextProfile.username ||
+      this.profile.screenName !== nextProfile.screenName;
+    if (identityChanged) {
+      this.profile = null;
+    }
+    if (this.lastCheckedTweetProfileId !== nextProfile.id) {
+      this.lastCheckedTweetId = null;
+      this.lastCheckedTweetProfileId = nextProfile.id;
+    }
+
+    const entity = await this.runtime.getEntityById(this.runtime.agentId);
+    const entityMetadata = entity?.metadata as
+      | {
+          twitter?: {
+            id?: string;
+            userName?: string;
+            name?: string;
+            [k: string]: unknown;
+          };
+          [k: string]: unknown;
+        }
+      | undefined;
+    const storedIdentity = entityMetadata?.twitter;
+    if (
+      storedIdentity?.id !== nextProfile.id ||
+      storedIdentity?.userName !== nextProfile.username ||
+      storedIdentity?.name !== nextProfile.screenName
+    ) {
+      const priorXNames = new Set(
+        [storedIdentity?.userName, storedIdentity?.name]
+          .filter((name): name is string => Boolean(name))
+          .map((name) => name.toLowerCase()),
+      );
+      const canonicalCharacterNames = new Set(
+        [this.runtime.character?.name]
+          .filter((name): name is string => Boolean(name))
+          .map((name) => name.toLowerCase()),
+      );
+      const retainedNames = (entity?.names || []).filter(
+        (name) =>
+          !priorXNames.has(name.toLowerCase()) ||
+          canonicalCharacterNames.has(name.toLowerCase()),
+      );
+      const currentXNames = [nextProfile.screenName, nextProfile.username];
+      await this.runtime.updateEntity({
+        id: this.runtime.agentId,
+        names: [...new Set([...retainedNames, ...currentXNames])],
+        metadata: {
+          ...(entityMetadata || {}),
+          twitter: {
+            ...(storedIdentity || {}),
+            id: nextProfile.id,
+            name: nextProfile.screenName,
+            userName: nextProfile.username,
+          },
+        },
+        agentId: this.runtime.agentId,
+      });
+    }
+
+    this.profile = nextProfile;
+    return {
+      client: session.client,
+      profile: nextProfile,
+      revision: session.revision,
+    };
+  }
+
+  async withAuthenticatedSession<T>(
+    operation: (session: TwitterAccountSession) => Promise<T>,
+  ): Promise<T> {
+    return this.twitterClient.withAuthenticatedSession(async (session) => {
+      const synchronized = await this.twitterClient.withCurrentSession(
+        session,
+        () => this.synchronizeAuthenticatedSession(session),
+      );
+      return operation(synchronized);
+    });
+  }
+
+  async getAuthenticatedSession(): Promise<TwitterAccountSession> {
+    return this.withAuthenticatedSession(async (session) => session);
+  }
+
+  isAuthenticatedSessionCurrent(session: TwitterAccountSession): boolean {
+    return this.twitterClient.isAuthenticatedSessionCurrent(session);
+  }
+
+  async getAuthenticatedProfile(): Promise<TwitterProfile> {
+    return (await this.getAuthenticatedSession()).profile;
   }
 
   private hasTweetIdentity(tweet: Tweet): tweet is TweetWithIdentity {
@@ -400,84 +514,22 @@ export class ClientBase {
       );
     }
 
-    // Initialize Twitter profile from the authenticated user
-    const profile = await this.twitterClient.me();
-    if (profile) {
-      logger.log("Twitter user ID:", profile.userId);
-      logger.log("Twitter loaded:", JSON.stringify(profile, null, 10));
-
-      const agentId = this.runtime.agentId;
-
-      const entity = await this.runtime.getEntityById(agentId);
-      const entityMetadata = entity?.metadata as
-        | {
-            twitter?: {
-              userName?: string;
-              name?: string;
-              [k: string]: unknown;
-            };
-            [k: string]: unknown;
-          }
-        | undefined;
-      if (!profile.userId || !profile.username) {
-        throw new Error(
-          "Authenticated Twitter profile is missing id or username",
-        );
-      }
-
-      if (entityMetadata?.twitter?.userName !== profile.username) {
-        logger.log(
-          "Updating Agents known X/twitter handle",
-          profile.username,
-          "was",
-          entityMetadata?.twitter,
-        );
-        const names = [profile.name, profile.username].filter(
-          (name): name is string => typeof name === "string" && name.length > 0,
-        );
-        await this.runtime.updateEntity({
-          id: agentId,
-          names: [...new Set([...(entity?.names || []), ...names])],
-          metadata: {
-            ...(entityMetadata || {}),
-            twitter: {
-              ...(entityMetadata?.twitter || {}),
-              name: profile.name,
-              userName: profile.username,
-            },
-          },
-          agentId,
-        });
-      }
-
-      // Store profile info for use in responses
-      this.profile = {
-        id: profile.userId,
-        username: profile.username, // this is the at
-        screenName: profile.name ?? profile.username, // this is the human readable name
-        bio: profile.biography || "",
-        nicknames: resolveAgentNicknames(this.runtime, {
-          username: profile.username,
-          screenName: profile.name ?? profile.username,
-        }),
-      };
-    } else {
-      throw new Error("Failed to load profile");
-    }
+    await this.getAuthenticatedProfile();
 
     await this.loadLatestCheckedTweetId();
     await this.populateTimeline();
   }
 
   async fetchOwnPosts(count: number): Promise<Tweet[]> {
-    logger.debug("fetching own posts");
-    const profile = this.requireProfile();
-    const homeTimeline = await this.twitterClient.getUserTweets(
-      profile.id,
-      count,
-    );
-    // homeTimeline.tweets already contains Tweet objects from v2 API, no parsing needed
-    return homeTimeline.tweets;
+    return this.withAuthenticatedSession(async ({ profile }) => {
+      logger.debug("fetching own posts");
+      const homeTimeline = await this.twitterClient.getUserTweets(
+        profile.id,
+        count,
+      );
+      // homeTimeline.tweets already contains Tweet objects from v2 API, no parsing needed
+      return homeTimeline.tweets;
+    });
   }
 
   /**
@@ -534,10 +586,15 @@ export class ClientBase {
   }
 
   private async populateTimeline() {
-    logger.debug("populating timeline...");
-    const profile = this.requireProfile();
+    return this.withAuthenticatedSession(({ profile }) =>
+      this.populateTimelineFor(profile),
+    );
+  }
 
-    const cachedTimeline = await this.getCachedTimeline();
+  private async populateTimelineFor(profile: TwitterProfile) {
+    logger.debug("populating timeline...");
+
+    const cachedTimeline = await this.getCachedTimeline(profile);
     const validCachedTimeline =
       cachedTimeline?.filter((tweet): tweet is TweetWithIdentity =>
         this.hasTweetIdentity(tweet),
@@ -795,8 +852,8 @@ export class ClientBase {
     }
 
     // Cache
-    await this.cacheTimeline(timeline);
-    await this.cacheMentions(mentionsAndInteractions.tweets);
+    await this.cacheTimeline(timeline, profile);
+    await this.cacheMentions(mentionsAndInteractions.tweets, profile);
   }
 
   async saveRequestMessage(message: Memory, _state: State) {
@@ -818,19 +875,30 @@ export class ClientBase {
   }
 
   async loadLatestCheckedTweetId(): Promise<void> {
-    const profile = this.requireProfile();
-    const latestCheckedTweetId = await this.runtime.getCache<string>(
-      `twitter/${profile.username}/latest_checked_tweet_id`,
-    );
-
-    if (latestCheckedTweetId) {
-      this.lastCheckedTweetId = BigInt(latestCheckedTweetId);
-    }
+    await this.withAuthenticatedSession(async ({ profile }) => {
+      const latestCheckedTweetId = await this.runtime.getCache<string>(
+        `twitter/${profile.username}/latest_checked_tweet_id`,
+      );
+      this.lastCheckedTweetProfileId = profile.id;
+      this.lastCheckedTweetId = latestCheckedTweetId
+        ? BigInt(latestCheckedTweetId)
+        : null;
+    });
   }
 
-  async cacheLatestCheckedTweetId() {
-    if (this.lastCheckedTweetId) {
-      const profile = this.requireProfile();
+  async cacheLatestCheckedTweetId(
+    authenticatedProfile?: TwitterProfile,
+  ): Promise<void> {
+    if (!authenticatedProfile) {
+      return this.withAuthenticatedSession(({ profile }) =>
+        this.cacheLatestCheckedTweetId(profile),
+      );
+    }
+    const profile = authenticatedProfile;
+    if (
+      this.lastCheckedTweetId !== null &&
+      this.lastCheckedTweetProfileId === profile.id
+    ) {
       await this.runtime.setCache<string>(
         `twitter/${profile.username}/latest_checked_tweet_id`,
         this.lastCheckedTweetId.toString(),
@@ -838,10 +906,33 @@ export class ClientBase {
     }
   }
 
-  async getCachedTimeline(): Promise<Tweet[] | undefined> {
-    const profile = this.requireProfile();
+  getLatestCheckedTweetId(profileId: string): bigint | null {
+    return this.lastCheckedTweetProfileId === profileId
+      ? this.lastCheckedTweetId
+      : null;
+  }
+
+  recordLatestCheckedTweetId(profileId: string, tweetId: bigint): void {
+    if (this.profile?.id !== profileId) {
+      return;
+    }
+    if (
+      this.lastCheckedTweetProfileId === profileId &&
+      this.lastCheckedTweetId !== null &&
+      tweetId <= this.lastCheckedTweetId
+    ) {
+      return;
+    }
+    this.lastCheckedTweetProfileId = profileId;
+    this.lastCheckedTweetId = tweetId;
+  }
+
+  async getCachedTimeline(
+    profile?: TwitterProfile,
+  ): Promise<Tweet[] | undefined> {
+    const currentProfile = profile ?? (await this.getAuthenticatedProfile());
     const cached = await this.runtime.getCache<Tweet[]>(
-      `twitter/${profile.username}/timeline`,
+      `twitter/${currentProfile.username}/timeline`,
     );
 
     if (!cached) {
@@ -851,18 +942,18 @@ export class ClientBase {
     return cached;
   }
 
-  async cacheTimeline(timeline: Tweet[]) {
-    const profile = this.requireProfile();
+  async cacheTimeline(timeline: Tweet[], profile?: TwitterProfile) {
+    const currentProfile = profile ?? (await this.getAuthenticatedProfile());
     await this.runtime.setCache<Tweet[]>(
-      `twitter/${profile.username}/timeline`,
+      `twitter/${currentProfile.username}/timeline`,
       timeline,
     );
   }
 
-  async cacheMentions(mentions: Tweet[]) {
-    const profile = this.requireProfile();
+  async cacheMentions(mentions: Tweet[], profile?: TwitterProfile) {
+    const currentProfile = profile ?? (await this.getAuthenticatedProfile());
     await this.runtime.setCache<Tweet[]>(
-      `twitter/${profile.username}/mentions`,
+      `twitter/${currentProfile.username}/mentions`,
       mentions,
     );
   }
@@ -903,7 +994,7 @@ export class ClientBase {
           username,
           screenName: profile.name || characterName,
           bio: profile.biography || characterBio,
-          nicknames: this.profile?.nicknames || [],
+          nicknames: [],
         } satisfies TwitterProfile;
       });
 
@@ -919,20 +1010,21 @@ export class ClientBase {
    */
   async fetchInteractions() {
     try {
-      const username = this.requireProfile().username;
-      // Use fetchSearchTweets to get mentions instead of the non-existent get method
-      const mentionsResponse = await this.requestQueue.add(() =>
-        this.twitterClient.fetchSearchTweets(
-          `@${username}`,
-          100,
-          SearchMode.Latest,
-        ),
-      );
+      return await this.withAuthenticatedSession(async ({ profile }) => {
+        // Use fetchSearchTweets to get mentions instead of the non-existent get method
+        const mentionsResponse = await this.requestQueue.add(() =>
+          this.twitterClient.fetchSearchTweets(
+            `@${profile.username}`,
+            100,
+            SearchMode.Latest,
+          ),
+        );
 
-      // Process tweets directly into the expected interaction format
-      return mentionsResponse.tweets.map((tweet) =>
-        this.formatTweetToInteraction(tweet),
-      );
+        // Process tweets directly into the expected interaction format
+        return mentionsResponse.tweets.map((tweet) =>
+          this.formatTweetToInteraction(tweet),
+        );
+      });
     } catch (error) {
       // error-policy:J7 a mentions/interactions fetch failure must surface to the
       // agent rather than reading as no interactions; degrade to an empty list

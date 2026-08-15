@@ -7,7 +7,7 @@
  */
 import type { IAgentRuntime, Memory } from "@elizaos/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ClientBase } from "./base";
+import type { ClientBase, TwitterAccountSession, TwitterProfile } from "./base";
 import { TwitterDirectMessageClient } from "./direct-messages";
 import type { TwitterClientState } from "./types";
 
@@ -15,6 +15,37 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
+
+const defaultProfile: TwitterProfile = {
+  id: "agent-user-id",
+  username: "elizamakesmagic",
+  screenName: "Eliza",
+  bio: "",
+  nicknames: [],
+};
+
+function createDmClient(
+  api: unknown,
+  options: {
+    profile?: TwitterProfile;
+    snapshot?: Pick<TwitterProfile, "id" | "username">;
+    getSession?: () => Promise<TwitterAccountSession>;
+    isCurrent?: (session: TwitterAccountSession) => boolean;
+  } = {},
+): ClientBase {
+  const profile = options.profile ?? defaultProfile;
+  const session = {
+    client: api as TwitterAccountSession["client"],
+    profile,
+    revision: 1,
+  };
+  return {
+    accountId: "agent",
+    profile: options.snapshot ?? profile,
+    getAuthenticatedSession: options.getSession ?? (async () => session),
+    isAuthenticatedSessionCurrent: options.isCurrent ?? (() => true),
+  } as unknown as ClientBase;
+}
 
 describe("TwitterDirectMessageClient", () => {
   it("routes configured DMs to personal Eliza without invoking the public agent", async () => {
@@ -71,15 +102,13 @@ describe("TwitterDirectMessageClient", () => {
         key === "TWITTER_BROKER_TOKEN" ? "test-broker-token" : null,
       ),
     } as unknown as IAgentRuntime;
-    const client = {
-      accountId: "agent",
-      profile: { id: "222", username: "elizamakesmagic" },
-      twitterClient: {
-        getV2Client: async () => ({
-          v2: { listDmEvents, sendDmToParticipant },
-        }),
+    const client = createDmClient(
+      { v2: { listDmEvents, sendDmToParticipant } },
+      {
+        profile: { ...defaultProfile, id: "222" },
+        snapshot: { id: "stale-account", username: "stale-agent" },
       },
-    } as unknown as ClientBase;
+    );
     const dmClient = new TwitterDirectMessageClient(client, runtime, {
       TWITTER_DRY_RUN: "false",
       TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
@@ -111,6 +140,74 @@ describe("TwitterDirectMessageClient", () => {
       text: "Your next event is at 2 PM.",
     });
     expect(cache.get("twitter/agent/222/dm_cursor")).toBe("501");
+    await dmClient.stop();
+  });
+
+  it("does not route or settle a DM after its captured account session becomes stale", async () => {
+    vi.useFakeTimers();
+    const listDmEvents = vi.fn(async () => ({
+      events: [
+        {
+          id: "501",
+          sender_id: "111",
+          dm_conversation_id: "conversation-1",
+          text: "what is on my calendar?",
+          event_type: "MessageCreate",
+        },
+      ],
+      includes: { users: [{ id: "111", username: "alice", name: "Alice" }] },
+    }));
+    const sendDmToParticipant = vi.fn();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const cache = new Map<string, string>([
+      ["twitter/agent/222/dm_cursor", "500"],
+    ]);
+    const runtime = {
+      agentId: "00000000-0000-0000-0000-000000000001",
+      getCache: async (key: string) => cache.get(key),
+      setCache: async (key: string, value: string) => {
+        cache.set(key, value);
+      },
+      deleteCache: async (key: string) => cache.delete(key),
+      getMemoryById: async () => null,
+      createMemory: vi.fn(async () => undefined),
+      ensureWorldExists: vi.fn(async () => undefined),
+      updateWorld: vi.fn(async () => undefined),
+      ensureRoomExists: vi.fn(async () => undefined),
+      ensureConnection: vi.fn(async () => undefined),
+      reportError: vi.fn(),
+      getSetting: vi.fn((key: string) =>
+        key === "TWITTER_BROKER_TOKEN" ? "test-broker-token" : null,
+      ),
+    } as unknown as IAgentRuntime;
+    const isCurrent = vi
+      .fn<(session: TwitterAccountSession) => boolean>()
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
+    const client = createDmClient(
+      { v2: { listDmEvents, sendDmToParticipant } },
+      { profile: { ...defaultProfile, id: "222" }, isCurrent },
+    );
+    const dmClient = new TwitterDirectMessageClient(client, runtime, {
+      TWITTER_DRY_RUN: "false",
+      TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
+      TWITTER_PERSONAL_DM_ROUTER_URL:
+        "https://cloud.eliza.app/api/v1/twitter/personal-message",
+    } as unknown as TwitterClientState);
+
+    await dmClient.start();
+
+    expect(isCurrent).toHaveBeenCalledTimes(2);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(sendDmToParticipant).not.toHaveBeenCalled();
+    expect(runtime.createMemory).not.toHaveBeenCalled();
+    expect(cache.get("twitter/agent/222/dm_cursor")).toBe("500");
+    expect(runtime.reportError).toHaveBeenCalledWith(
+      "XDirectMessages.poll",
+      expect.objectContaining({ code: "X_AUTH_SESSION_ROTATED" }),
+      { accountId: "agent" },
+    );
     await dmClient.stop();
   });
 
@@ -198,15 +295,9 @@ describe("TwitterDirectMessageClient", () => {
       reportError: vi.fn(),
       getSetting: vi.fn(() => null),
     } as unknown as IAgentRuntime;
-    const client = {
-      accountId: "agent",
-      profile: { id: "agent-user-id", username: "elizamakesmagic" },
-      twitterClient: {
-        getV2Client: async () => ({
-          v2: { listDmEvents, sendDmToParticipant },
-        }),
-      },
-    } as unknown as ClientBase;
+    const client = createDmClient({
+      v2: { listDmEvents, sendDmToParticipant },
+    });
     const state = {
       TWITTER_DRY_RUN: "false",
       TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
@@ -236,6 +327,101 @@ describe("TwitterDirectMessageClient", () => {
     expect(handleMessage).toHaveBeenCalledTimes(1);
     expect(sendDmToParticipant).toHaveBeenCalledTimes(1);
 
+    await dmClient.stop();
+  });
+
+  it("refreshes identity before choosing the cursor namespace and filtering self events", async () => {
+    vi.useFakeTimers();
+    const cache = new Map<string, string>([
+      ["twitter/agent/old-agent-id/dm_cursor", "999"],
+      ["twitter/agent/new-agent-id/dm_cursor", "100"],
+    ]);
+    const listDmEvents = vi.fn(async () => ({
+      events: [
+        {
+          id: "101",
+          sender_id: "new-agent-id",
+          dm_conversation_id: "conversation-self",
+          text: "my own sent message",
+          event_type: "MessageCreate",
+        },
+        {
+          id: "102",
+          sender_id: "person-1",
+          dm_conversation_id: "conversation-1",
+          text: "hello new account",
+          event_type: "MessageCreate",
+        },
+      ],
+      includes: {
+        users: [{ id: "person-1", username: "alice", name: "Alice" }],
+      },
+    }));
+    const sendDmToParticipant = vi.fn(async () => ({
+      data: { dm_event_id: "reply-102" },
+    }));
+    const handleMessage = vi.fn(
+      async (
+        _runtime: IAgentRuntime,
+        memory: Memory,
+        callback: (response: { text: string }) => Promise<Memory[]>,
+      ) => {
+        expect(memory.content.text).toBe("hello new account");
+        await callback({ text: "hello Alice" });
+      },
+    );
+    const runtime = {
+      agentId: "00000000-0000-0000-0000-000000000001",
+      getCache: async (key: string) => cache.get(key),
+      setCache: async (key: string, value: string) => {
+        cache.set(key, value);
+      },
+      deleteCache: async (key: string) => cache.delete(key),
+      getMemoryById: async () => null,
+      createMemory: vi.fn(async () => undefined),
+      ensureWorldExists: vi.fn(async () => undefined),
+      updateWorld: vi.fn(async () => undefined),
+      ensureRoomExists: vi.fn(async () => undefined),
+      ensureConnection: vi.fn(async () => undefined),
+      messageService: { handleMessage },
+      reportError: vi.fn(),
+      getSetting: vi.fn(() => null),
+    } as unknown as IAgentRuntime;
+    const currentProfile: TwitterProfile = {
+      id: "new-agent-id",
+      username: "new-agent",
+      screenName: "New Agent",
+      bio: "",
+      nicknames: [],
+    };
+    const api = {
+      v2: { listDmEvents, sendDmToParticipant },
+    };
+    const getAuthenticatedSession = vi.fn(async () => ({
+      client: api as TwitterAccountSession["client"],
+      profile: currentProfile,
+      revision: 2,
+    }));
+    const client = createDmClient(api, {
+      profile: currentProfile,
+      snapshot: { id: "old-agent-id", username: "old-agent" },
+      getSession: getAuthenticatedSession,
+    });
+    const dmClient = new TwitterDirectMessageClient(client, runtime, {
+      TWITTER_DRY_RUN: "false",
+      TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
+    } as unknown as TwitterClientState);
+
+    await dmClient.start();
+
+    expect(getAuthenticatedSession).toHaveBeenCalledOnce();
+    expect(getAuthenticatedSession.mock.invocationCallOrder[0]).toBeLessThan(
+      listDmEvents.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER,
+    );
+    expect(handleMessage).toHaveBeenCalledOnce();
+    expect(sendDmToParticipant).toHaveBeenCalledOnce();
+    expect(cache.get("twitter/agent/new-agent-id/dm_cursor")).toBe("102");
+    expect(cache.get("twitter/agent/old-agent-id/dm_cursor")).toBe("999");
     await dmClient.stop();
   });
 
@@ -323,15 +509,9 @@ describe("TwitterDirectMessageClient", () => {
       reportError: vi.fn(),
       getSetting: vi.fn(() => null),
     } as unknown as IAgentRuntime;
-    const client = {
-      accountId: "agent",
-      profile: { id: "agent-user-id", username: "elizamakesmagic" },
-      twitterClient: {
-        getV2Client: async () => ({
-          v2: { listDmEvents, sendDmToParticipant },
-        }),
-      },
-    } as unknown as ClientBase;
+    const client = createDmClient({
+      v2: { listDmEvents, sendDmToParticipant },
+    });
     const state = {
       TWITTER_DRY_RUN: "false",
       TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
@@ -401,15 +581,9 @@ describe("TwitterDirectMessageClient", () => {
       reportError: vi.fn(),
       getSetting: vi.fn(() => null),
     } as unknown as IAgentRuntime;
-    const client = {
-      accountId: "agent",
-      profile: { id: "agent-user-id", username: "elizamakesmagic" },
-      twitterClient: {
-        getV2Client: async () => ({
-          v2: { listDmEvents, sendDmToParticipant },
-        }),
-      },
-    } as unknown as ClientBase;
+    const client = createDmClient({
+      v2: { listDmEvents, sendDmToParticipant },
+    });
     const state = {
       TWITTER_DRY_RUN: "false",
       TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
@@ -495,15 +669,9 @@ describe("TwitterDirectMessageClient", () => {
       reportError: vi.fn(),
       getSetting: vi.fn(() => null),
     } as unknown as IAgentRuntime;
-    const client = {
-      accountId: "agent",
-      profile: { id: "agent-user-id", username: "elizamakesmagic" },
-      twitterClient: {
-        getV2Client: async () => ({
-          v2: { listDmEvents: async () => paginator, sendDmToParticipant },
-        }),
-      },
-    } as unknown as ClientBase;
+    const client = createDmClient({
+      v2: { listDmEvents: async () => paginator, sendDmToParticipant },
+    });
     const dmClient = new TwitterDirectMessageClient(client, runtime, {
       TWITTER_DRY_RUN: "false",
       TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
@@ -564,18 +732,12 @@ describe("TwitterDirectMessageClient", () => {
       reportError: vi.fn(),
       getSetting: vi.fn(() => null),
     } as unknown as IAgentRuntime;
-    const client = {
-      accountId: "agent",
-      profile: { id: "agent-user-id", username: "elizamakesmagic" },
-      twitterClient: {
-        getV2Client: async () => ({
-          v2: {
-            listDmEvents: async () => ({ events: [event] }),
-            sendDmToParticipant,
-          },
-        }),
+    const client = createDmClient({
+      v2: {
+        listDmEvents: async () => ({ events: [event] }),
+        sendDmToParticipant,
       },
-    } as unknown as ClientBase;
+    });
     const dmClient = new TwitterDirectMessageClient(client, runtime, {
       TWITTER_DRY_RUN: "false",
       TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
@@ -636,18 +798,12 @@ describe("TwitterDirectMessageClient", () => {
       reportError: vi.fn(),
       getSetting: vi.fn(() => null),
     } as unknown as IAgentRuntime;
-    const client = {
-      accountId: "agent",
-      profile: { id: "agent-user-id", username: "elizamakesmagic" },
-      twitterClient: {
-        getV2Client: async () => ({
-          v2: {
-            listDmEvents: async () => ({ events: [event] }),
-            sendDmToParticipant,
-          },
-        }),
+    const client = createDmClient({
+      v2: {
+        listDmEvents: async () => ({ events: [event] }),
+        sendDmToParticipant,
       },
-    } as unknown as ClientBase;
+    });
     const dmClient = new TwitterDirectMessageClient(client, runtime, {
       TWITTER_DRY_RUN: "false",
       TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
@@ -708,18 +864,12 @@ describe("TwitterDirectMessageClient", () => {
       reportError: vi.fn(),
       getSetting: vi.fn(() => null),
     } as unknown as IAgentRuntime;
-    const client = {
-      accountId: "agent",
-      profile: { id: "agent-user-id", username: "elizamakesmagic" },
-      twitterClient: {
-        getV2Client: async () => ({
-          v2: {
-            listDmEvents: async () => ({ events: [event] }),
-            sendDmToParticipant,
-          },
-        }),
+    const client = createDmClient({
+      v2: {
+        listDmEvents: async () => ({ events: [event] }),
+        sendDmToParticipant,
       },
-    } as unknown as ClientBase;
+    });
     const dmClient = new TwitterDirectMessageClient(client, runtime, {
       TWITTER_DRY_RUN: "false",
       TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
@@ -785,18 +935,12 @@ describe("TwitterDirectMessageClient", () => {
       reportError: vi.fn(),
       getSetting: vi.fn(() => null),
     } as unknown as IAgentRuntime;
-    const client = {
-      accountId: "agent",
-      profile: { id: "agent-user-id", username: "elizamakesmagic" },
-      twitterClient: {
-        getV2Client: async () => ({
-          v2: {
-            listDmEvents: async () => ({ events: [event] }),
-            sendDmToParticipant,
-          },
-        }),
+    const client = createDmClient({
+      v2: {
+        listDmEvents: async () => ({ events: [event] }),
+        sendDmToParticipant,
       },
-    } as unknown as ClientBase;
+    });
     const dmClient = new TwitterDirectMessageClient(client, runtime, {
       TWITTER_DRY_RUN: "false",
       TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
@@ -853,18 +997,12 @@ describe("TwitterDirectMessageClient", () => {
       reportError: vi.fn(),
       getSetting: vi.fn(() => null),
     } as unknown as IAgentRuntime;
-    const client = {
-      accountId: "agent",
-      profile: { id: "agent-user-id", username: "elizamakesmagic" },
-      twitterClient: {
-        getV2Client: async () => ({
-          v2: {
-            listDmEvents: async () => ({ events: [event] }),
-            sendDmToParticipant,
-          },
-        }),
+    const client = createDmClient({
+      v2: {
+        listDmEvents: async () => ({ events: [event] }),
+        sendDmToParticipant,
       },
-    } as unknown as ClientBase;
+    });
     const dmClient = new TwitterDirectMessageClient(client, runtime, {
       TWITTER_DRY_RUN: "false",
       TWITTER_DM_POLL_INTERVAL_SECONDS: "15",

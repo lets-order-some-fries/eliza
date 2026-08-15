@@ -1,7 +1,15 @@
 /** Unit tests for X account status and trusted multi-account connector routing. Network clients are deterministic fakes. */
-import type { Content, IAgentRuntime, TargetInfo } from "@elizaos/core";
+import {
+  type Content,
+  createUniqueUuid,
+  ElizaError,
+  type IAgentRuntime,
+  type TargetInfo,
+} from "@elizaos/core";
 import { describe, expect, it, vi } from "vitest";
+import { ClientBase } from "../base";
 import type { TwitterClientState } from "../types";
+import { TwitterPostService } from "./PostService";
 import { TwitterClientInstance, XService } from "./x.service";
 
 function asRuntime<T extends object>(runtime: T): IAgentRuntime & T {
@@ -24,6 +32,171 @@ function runtimeWithSettings(settings: Record<string, string>): IAgentRuntime {
 function serviceWithRuntime(settings: Record<string, string>): XService {
   return new XService(runtimeWithSettings(settings));
 }
+
+describe("ClientBase authenticated identity", () => {
+  it("refreshes entity metadata and clears account A's cursor on rotation to B", async () => {
+    let entity: {
+      id: string;
+      names: string[];
+      metadata: Record<string, unknown>;
+      agentId: string;
+    } = {
+      id: "agent-1",
+      names: ["Account A", "account-a", "Unrelated"],
+      metadata: {
+        twitter: {
+          id: "account-a",
+          userName: "account-a",
+          name: "Account A",
+        },
+      },
+      agentId: "agent-1",
+    };
+    const updateEntity = vi.fn(async (next: typeof entity) => {
+      entity = next;
+    });
+    const getCache = vi.fn(async (key: string) =>
+      key.includes("account-a") ? "900" : undefined,
+    );
+    const runtime = asRuntime({
+      agentId: "agent-1",
+      character: { name: "Account A" },
+      getSetting: () => undefined,
+      getEntityById: vi.fn(async () => entity),
+      updateEntity,
+      getCache,
+    });
+    const client = new ClientBase(runtime, {} as TwitterClientState);
+    let revision = 1;
+    let apiClient = { account: "a" };
+    let profile = {
+      userId: "account-a",
+      username: "account-a",
+      name: "Account A",
+      biography: "A",
+    };
+    client.twitterClient = {
+      withAuthenticatedSession: vi.fn(
+        async (
+          operation: (session: {
+            client: typeof apiClient;
+            profile: typeof profile;
+            revision: number;
+          }) => Promise<unknown>,
+        ) => operation({ client: apiClient, profile, revision }),
+      ),
+      withCurrentSession: vi.fn(
+        async (_session: unknown, operation: () => Promise<unknown>) =>
+          operation(),
+      ),
+      isAuthenticatedSessionCurrent: vi.fn(() => true),
+    } as unknown as ClientBase["twitterClient"];
+
+    await client.getAuthenticatedProfile();
+    await client.loadLatestCheckedTweetId();
+    expect(client.lastCheckedTweetId).toBe(900n);
+
+    revision = 2;
+    apiClient = { account: "b" };
+    profile = {
+      userId: "account-b",
+      username: "account-b",
+      name: "Account B",
+      biography: "B",
+    };
+    await expect(client.getAuthenticatedProfile()).resolves.toMatchObject({
+      id: "account-b",
+      username: "account-b",
+    });
+    expect(client.lastCheckedTweetId).toBeNull();
+    await client.loadLatestCheckedTweetId();
+    expect(client.lastCheckedTweetId).toBeNull();
+    expect(entity.metadata).toMatchObject({
+      twitter: {
+        id: "account-b",
+        userName: "account-b",
+        name: "Account B",
+      },
+    });
+    expect(entity.names).toEqual([
+      "Account A",
+      "Unrelated",
+      "Account B",
+      "account-b",
+    ]);
+    expect(getCache).toHaveBeenLastCalledWith(
+      "twitter/account-b/latest_checked_tweet_id",
+    );
+    expect(updateEntity).toHaveBeenCalled();
+  });
+
+  it("does not publish account B after durable identity metadata fails to update", async () => {
+    const entity = {
+      id: "agent-1",
+      names: ["Agent", "Account A", "account-a"],
+      metadata: {
+        twitter: {
+          id: "account-a",
+          userName: "account-a",
+          name: "Account A",
+        },
+      },
+      agentId: "agent-1",
+    };
+    const updateFailure = new Error("entity store unavailable");
+    const updateEntity = vi.fn(async () => {
+      throw updateFailure;
+    });
+    const runtime = asRuntime({
+      agentId: "agent-1",
+      character: { name: "Agent" },
+      getSetting: () => undefined,
+      getEntityById: vi.fn(async () => entity),
+      updateEntity,
+      getCache: vi.fn(async () => undefined),
+    });
+    const client = new ClientBase(runtime, {} as TwitterClientState);
+    let profile = {
+      userId: "account-a",
+      username: "account-a",
+      name: "Account A",
+      biography: "A",
+    };
+    client.twitterClient = {
+      withAuthenticatedSession: vi.fn(
+        async (
+          operation: (session: {
+            client: object;
+            profile: typeof profile;
+            revision: number;
+          }) => Promise<unknown>,
+        ) => operation({ client: {}, profile, revision: 1 }),
+      ),
+      withCurrentSession: vi.fn(
+        async (_session: unknown, operation: () => Promise<unknown>) =>
+          operation(),
+      ),
+      isAuthenticatedSessionCurrent: vi.fn(() => true),
+    } as unknown as ClientBase["twitterClient"];
+
+    await expect(client.getAuthenticatedProfile()).resolves.toMatchObject({
+      id: "account-a",
+    });
+    profile = {
+      userId: "account-b",
+      username: "account-b",
+      name: "Account B",
+      biography: "B",
+    };
+
+    await expect(client.getAuthenticatedProfile()).rejects.toBe(updateFailure);
+    expect(client.profile).toBeNull();
+    expect(entity).toMatchObject({
+      names: ["Agent", "Account A", "account-a"],
+      metadata: { twitter: { id: "account-a" } },
+    });
+  });
+});
 
 describe("XService account status", () => {
   it("honors account-scoped DM disablement over the runtime default", () => {
@@ -183,9 +356,257 @@ describe("XService account status", () => {
       authMode: "oauth",
     });
   });
+
+  it("refreshes a loaded account before exposing its identity", async () => {
+    const service = serviceWithRuntime({ TWITTER_AUTH_MODE: "broker" });
+    const currentProfile = {
+      id: "account-b",
+      username: "current-b",
+      screenName: "Current B",
+      bio: "",
+      nicknames: [],
+    };
+    const getAuthenticatedProfile = vi.fn(async () => currentProfile);
+    (
+      service as unknown as {
+        accountClients: Map<
+          string,
+          {
+            accountId: string;
+            client: {
+              profile: typeof currentProfile;
+              getAuthenticatedProfile: typeof getAuthenticatedProfile;
+            };
+          }
+        >;
+      }
+    ).accountClients.set("default", {
+      accountId: "default",
+      client: { profile: currentProfile, getAuthenticatedProfile },
+    });
+
+    await expect(service.getAccountStatus("default")).resolves.toMatchObject({
+      connected: true,
+      reason: "connected",
+      identity: {
+        userId: "account-b",
+        username: "current-b",
+        name: "Current B",
+      },
+    });
+    expect(service.getActiveProfile("default")).toMatchObject({
+      id: "account-b",
+    });
+    expect(getAuthenticatedProfile).toHaveBeenCalledOnce();
+    await expect(
+      service.refreshActiveProfile("default"),
+    ).resolves.toMatchObject({ id: "account-b" });
+    expect(getAuthenticatedProfile).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports needs_reauth instead of stale identity after refresh failure", async () => {
+    const service = serviceWithRuntime({ TWITTER_AUTH_MODE: "broker" });
+    const authFailure = new ElizaError("credentials rejected", {
+      code: "X_AUTH_REJECTED",
+    });
+    const getAuthenticatedProfile = vi.fn(async () => {
+      throw authFailure;
+    });
+    (
+      service as unknown as {
+        accountClients: Map<
+          string,
+          {
+            accountId: string;
+            client: { getAuthenticatedProfile: typeof getAuthenticatedProfile };
+          }
+        >;
+      }
+    ).accountClients.set("default", {
+      accountId: "default",
+      client: { getAuthenticatedProfile },
+    });
+
+    await expect(service.getAccountStatus("default")).resolves.toMatchObject({
+      configured: true,
+      connected: false,
+      reason: "needs_reauth",
+      identity: null,
+      grantedCapabilities: [],
+      grantedScopes: [],
+    });
+    await expect(service.refreshActiveProfile("default")).rejects.toBe(
+      authFailure,
+    );
+  });
+
+  it("propagates provider and metadata failures instead of misreporting reauthentication", async () => {
+    const service = serviceWithRuntime({ TWITTER_AUTH_MODE: "broker" });
+    const providerFailure = new ElizaError("profile provider unavailable", {
+      code: "X_ME_FETCH_FAILED",
+    });
+    const getAuthenticatedProfile = vi.fn(async () => {
+      throw providerFailure;
+    });
+    (
+      service as unknown as {
+        accountClients: Map<
+          string,
+          {
+            accountId: string;
+            client: { getAuthenticatedProfile: typeof getAuthenticatedProfile };
+          }
+        >;
+      }
+    ).accountClients.set("default", {
+      accountId: "default",
+      client: { getAuthenticatedProfile },
+    });
+
+    await expect(service.getAccountStatus("default")).rejects.toBe(
+      providerFailure,
+    );
+  });
 });
 
 describe("XService trusted account routing", () => {
+  it("uses the refreshed identity for post room and author attribution", async () => {
+    const runtime = runtimeWithSettings({});
+    const service = new XService(runtime);
+    const profile = {
+      id: "account-b",
+      username: "current-b",
+      screenName: "Current B",
+      bio: "",
+      nicknames: [],
+    };
+    vi.spyOn(
+      service as unknown as {
+        getTwitterClientForAccount: (accountId: unknown) => Promise<{
+          client: {
+            withAuthenticatedSession: (
+              operation: (session: {
+                profile: typeof profile;
+              }) => Promise<unknown>,
+            ) => Promise<unknown>;
+          };
+        }>;
+      },
+      "getTwitterClientForAccount",
+    ).mockResolvedValue({
+      client: {
+        withAuthenticatedSession: async (
+          operation: (session: { profile: typeof profile }) => Promise<unknown>,
+        ) => operation({ profile }),
+      },
+    });
+    const roomId = createUniqueUuid(runtime, `x:default:feed:${profile.id}`);
+    const createPost = vi
+      .spyOn(TwitterPostService.prototype, "createPost")
+      .mockResolvedValue({
+        id: "tweet-b",
+        agentId: runtime.agentId,
+        roomId,
+        userId: profile.id,
+        username: profile.username,
+        text: "hello from b",
+        timestamp: 1_786_800_000_000,
+        metrics: {
+          likes: 0,
+          reposts: 0,
+          replies: 0,
+          quotes: 0,
+          views: 0,
+        },
+        media: [],
+        metadata: {},
+      });
+
+    await service.handleSendPost(runtime, { text: "hello from b" });
+
+    expect(createPost).toHaveBeenCalledWith(
+      expect.objectContaining({ roomId, text: "hello from b" }),
+      profile,
+    );
+  });
+
+  it("classifies recent DMs with the identity bound to the API session", async () => {
+    const runtime = runtimeWithSettings({});
+    const service = new XService(runtime);
+    const events = [
+      {
+        id: "2",
+        dm_conversation_id: "conversation-b",
+        sender_id: "account-b",
+        text: "sent by current account",
+        event_type: "MessageCreate",
+        participant_ids: ["account-b", "person-1"],
+      },
+      {
+        id: "1",
+        dm_conversation_id: "conversation-a",
+        sender_id: "account-a",
+        text: "sent by prior account",
+        event_type: "MessageCreate",
+        participant_ids: ["account-a", "person-1"],
+      },
+    ];
+    const iterator = {
+      includes: {
+        users: [
+          { id: "account-a", username: "prior-a" },
+          { id: "account-b", username: "current-b" },
+        ],
+      },
+      async *[Symbol.asyncIterator]() {
+        yield* events;
+      },
+    };
+    const listDmEvents = vi.fn(() => iterator);
+    const profile = {
+      id: "account-b",
+      username: "current-b",
+      screenName: "Current B",
+      bio: "",
+      nicknames: [],
+    };
+    const api = { v2: { listDmEvents } };
+    const withAuthenticatedSession = vi.fn(
+      async (
+        operation: (session: {
+          client: typeof api;
+          profile: typeof profile;
+          revision: number;
+        }) => Promise<unknown>,
+      ) => operation({ client: api, profile, revision: 2 }),
+    );
+    vi.spyOn(
+      service as unknown as {
+        getTwitterClientForAccount: (accountId: unknown) => Promise<{
+          client: {
+            withAuthenticatedSession: typeof withAuthenticatedSession;
+          };
+        }>;
+      },
+      "getTwitterClientForAccount",
+    ).mockResolvedValue({ client: { withAuthenticatedSession } });
+
+    const messages = await (
+      service as unknown as {
+        listRecentDirectMessages: (
+          accountId: string,
+          limit: number,
+        ) => Promise<Array<{ senderId: string; isInbound: boolean }>>;
+      }
+    ).listRecentDirectMessages("default", 10);
+
+    expect(withAuthenticatedSession).toHaveBeenCalledOnce();
+    expect(messages).toEqual([
+      expect.objectContaining({ senderId: "account-b", isInbound: false }),
+      expect.objectContaining({ senderId: "account-a", isInbound: true }),
+    ]);
+  });
+
   it("routes feed reads through the trusted secondary account context", async () => {
     const runtime = runtimeWithSettings({});
     const service = new XService(runtime);

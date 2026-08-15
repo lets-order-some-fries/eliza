@@ -46,9 +46,25 @@ function makeRuntime(overrides: Partial<IAgentRuntime> = {}): IAgentRuntime & {
 }
 
 function makeClient(): ClientBase {
+  const profile = {
+    id: "twitter-user-1",
+    username: "agent",
+    screenName: "Agent",
+    bio: "",
+    nicknames: [],
+  };
   return {
     accountId: "default",
     lastCheckedTweetId: null,
+    runtime: { reportError: vi.fn() },
+    profile,
+    withAuthenticatedSession: async (
+      operation: (session: {
+        client: unknown;
+        profile: typeof profile;
+        revision: number;
+      }) => Promise<unknown>,
+    ) => operation({ client: {}, profile, revision: 1 }),
     twitterClient: {
       sendTweet: vi.fn().mockImplementation(async (text: string) => ({
         data: {
@@ -60,6 +76,7 @@ function makeClient(): ClientBase {
       })),
     },
     cacheLatestCheckedTweetId: vi.fn(async () => undefined),
+    recordLatestCheckedTweetId: vi.fn(),
     cacheTweet: vi.fn(async () => undefined),
   } as unknown as ClientBase;
 }

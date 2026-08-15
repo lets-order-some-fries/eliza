@@ -15,12 +15,13 @@ import {
   ChannelType,
   type Content,
   createUniqueUuid,
+  ElizaError,
   type HandlerCallback,
   type IAgentRuntime,
   logger,
   type Memory,
 } from "@elizaos/core";
-import type { ClientBase } from "./base";
+import type { ClientBase, TwitterAccountSession } from "./base";
 import type { TwitterClientState } from "./types";
 import { createMemorySafe, reconcileTwitterWorld } from "./utils/memory";
 import { getSetting } from "./utils/settings";
@@ -198,16 +199,13 @@ export class TwitterDirectMessageClient {
   }
 
   private async processNewMessages(): Promise<void> {
-    const profile = this.client.profile;
-    if (!profile?.id) {
-      throw new Error("X DM polling requires an authenticated profile.");
-    }
+    const session = await this.client.getAuthenticatedSession();
+    const { client: api, profile } = session;
 
     const stateKeyPrefix = `twitter/${this.client.accountId}/${profile.id}`;
     const cursorKey = `${stateKeyPrefix}/dm_cursor`;
     const cursor = (await this.runtime.getCache<string>(cursorKey)) ?? "";
 
-    const api = await this.client.twitterClient.getV2Client();
     const page = (await api.v2.listDmEvents({
       max_results: 50,
       "dm_event.fields": [
@@ -261,6 +259,12 @@ export class TwitterDirectMessageClient {
     const events = collectEvents().sort((left, right) =>
       compareEventIds(left.id, right.id),
     );
+    if (!this.client.isAuthenticatedSessionCurrent(session)) {
+      throw new ElizaError(
+        "X credentials rotated while direct messages were being read",
+        { code: "X_AUTH_SESSION_ROTATED" },
+      );
+    }
     if (events.length === 0) return;
 
     const newestId = events[events.length - 1]?.id;
@@ -297,6 +301,7 @@ export class TwitterDirectMessageClient {
         event as DirectMessageEvent & { id: string; sender_id: string },
         users.get(event.sender_id),
         stateKeyPrefix,
+        session,
       );
       await this.runtime.setCache(cursorKey, event.id);
     }
@@ -306,6 +311,7 @@ export class TwitterDirectMessageClient {
     event: DirectMessageEvent & { id: string; sender_id: string },
     user: { id: string; username?: string; name?: string } | undefined,
     stateKeyPrefix: string,
+    session: TwitterAccountSession,
   ): Promise<void> {
     // Delivery settlement is tracked separately from inbound-memory existence:
     // the marker is written only after the reply round-trip finished, so a
@@ -416,6 +422,13 @@ export class TwitterDirectMessageClient {
         return [];
       }
       egressAttempted = true;
+      if (!this.client.isAuthenticatedSessionCurrent(session)) {
+        deliveryError = new ElizaError(
+          "X credentials rotated before the direct-message reply was sent",
+          { code: "X_AUTH_SESSION_ROTATED" },
+        );
+        throw deliveryError;
+      }
       if (this.isDryRun) {
         logger.info(
           { src: "plugin:x", senderId, text },
@@ -424,7 +437,7 @@ export class TwitterDirectMessageClient {
         return [];
       }
 
-      const api = await this.client.twitterClient.getV2Client();
+      const api = session.client;
       const isGroup = (event.participant_ids?.length ?? 0) > 2;
       let sent: unknown;
       // X's DM create endpoints do not accept an idempotency key. Persist a
@@ -509,9 +522,15 @@ export class TwitterDirectMessageClient {
 
     const personalRouterUrl = this.personalDmRouterUrl();
     if (personalRouterUrl) {
+      if (!this.client.isAuthenticatedSessionCurrent(session)) {
+        throw new ElizaError(
+          "X credentials rotated before the direct message was routed",
+          { code: "X_AUTH_SESSION_ROTATED" },
+        );
+      }
       await createMemorySafe(this.runtime, inboundMemory, "messages");
       const reply = await this.routePersonalDm({
-        recipientTwitterUserId: this.client.profile?.id ?? "",
+        recipientTwitterUserId: session.profile.id,
         senderTwitterUserId: senderId,
         senderUsername: username,
         displayName,

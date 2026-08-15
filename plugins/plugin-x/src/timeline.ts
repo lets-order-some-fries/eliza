@@ -9,6 +9,7 @@ import {
   ChannelType,
   composePromptFromState,
   createUniqueUuid,
+  ElizaError,
   type IAgentRuntime,
   logger,
   type Memory,
@@ -17,7 +18,7 @@ import {
   type State,
   type UUID,
 } from "@elizaos/core";
-import type { ClientBase } from "./base";
+import type { ClientBase, TwitterAccountSession, TwitterProfile } from "./base";
 import type { Client, Tweet } from "./client/index";
 import {
   quoteTweetTemplate,
@@ -95,6 +96,10 @@ function normalizeTweet(tweet: Tweet): ActionableTweet | null {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isSessionRotation(error: unknown): boolean {
+  return error instanceof ElizaError && error.code === "X_AUTH_SESSION_ROTATED";
 }
 
 /**
@@ -183,7 +188,11 @@ export class TwitterTimelineClient {
         `Timeline client will check every ${engagementIntervalMinutes} minutes`,
       );
 
-      this.handleTimeline();
+      // error-policy:J5 the scheduled promise is observed here; failures are
+      // reported through the runtime because no caller awaits this loop.
+      void this.handleTimeline().catch((error: unknown) => {
+        this.runtime.reportError("XTimelineClient.handleTimeline", error);
+      });
 
       if (this.isRunning) {
         setTimeout(handleTwitterTimelineLoop, actionInterval);
@@ -198,17 +207,24 @@ export class TwitterTimelineClient {
   }
 
   async getTimeline(count: number): Promise<ActionableTweet[]> {
-    const twitterUsername = this.client.profile?.username;
+    return this.client.withAuthenticatedSession(({ profile }) =>
+      this.getTimelineForProfile(count, profile),
+    );
+  }
+
+  private async getTimelineForProfile(
+    count: number,
+    profile: TwitterProfile,
+  ): Promise<ActionableTweet[]> {
     const homeTimeline =
       this.timelineType === TIMELINE_TYPE.Following
         ? await this.twitterClient.fetchFollowingTimeline(count, [])
         : await this.twitterClient.fetchHomeTimeline(count, []);
 
-    // The timeline methods now return Tweet objects directly from v2 API
     return homeTimeline
       .map((tweet) => normalizeTweet(tweet))
       .filter((tweet): tweet is ActionableTweet => tweet !== null)
-      .filter((tweet) => tweet.username !== twitterUsername); // do not perform action on self-tweets
+      .filter((tweet) => tweet.userId !== profile.id);
   }
 
   /**
@@ -294,9 +310,18 @@ export class TwitterTimelineClient {
   }
 
   async handleTimeline() {
+    return this.client.withAuthenticatedSession((session) =>
+      this.handleTimelineForProfile(session.profile, session),
+    );
+  }
+
+  private async handleTimelineForProfile(
+    profile: TwitterProfile,
+    session: TwitterAccountSession,
+  ) {
     logger.info("Starting Twitter timeline processing...");
 
-    const tweets = await this.getTimeline(20);
+    const tweets = await this.getTimelineForProfile(20, profile);
     logger.info(`Fetched ${tweets.length} tweets from timeline`);
 
     // Use max engagements per run from environment
@@ -414,12 +439,13 @@ Choose any combination of [LIKE], [RETWEET], [QUOTE], and [REPLY] that are appro
       logger.info(`Actions to execute:\n${actionSummary.join("\n")}`);
     }
 
-    await this.processTimelineActions(prioritizedTweets);
+    await this.processTimelineActions(prioritizedTweets, session);
     logger.info("Timeline processing complete");
   }
 
   private async processTimelineActions(
     tweetDecisions: TweetDecision[],
+    session: TwitterAccountSession,
   ): Promise<
     {
       tweetId: string;
@@ -487,27 +513,30 @@ Choose any combination of [LIKE], [RETWEET], [QUOTE], and [REPLY] that are appro
         await this.ensureTweetWorldContext(tweet, roomId, worldId, entityId);
 
         if (actionResponse.like) {
+          this.assertCurrentSession(session);
           await this.handleLikeAction(tweet);
           executedActions.push("like");
         }
 
         if (actionResponse.retweet) {
+          this.assertCurrentSession(session);
           await this.handleRetweetAction(tweet);
           executedActions.push("retweet");
         }
 
         if (actionResponse.quote) {
-          await this.handleQuoteAction(tweet, mediaDescriptions);
+          await this.handleQuoteAction(tweet, mediaDescriptions, session);
           executedActions.push("quote");
         }
 
         if (actionResponse.reply) {
-          await this.handleReplyAction(tweet, mediaDescriptions);
+          await this.handleReplyAction(tweet, mediaDescriptions, session);
           executedActions.push("reply");
         }
 
         results.push({ tweetId: tweet.id, actionResponse, executedActions });
       } catch (error) {
+        if (isSessionRotation(error)) throw error;
         logger.error(
           `Error processing actions for tweet ${tweet.id}:`,
           errorMessage(error),
@@ -516,6 +545,15 @@ Choose any combination of [LIKE], [RETWEET], [QUOTE], and [REPLY] that are appro
     }
 
     return results;
+  }
+
+  private assertCurrentSession(session: TwitterAccountSession): void {
+    if (!this.client.isAuthenticatedSessionCurrent(session)) {
+      throw new ElizaError(
+        "X credentials rotated before a timeline action was executed",
+        { code: "X_AUTH_SESSION_ROTATED" },
+      );
+    }
   }
 
   private async ensureTweetWorldContext(
@@ -571,6 +609,7 @@ Choose any combination of [LIKE], [RETWEET], [QUOTE], and [REPLY] that are appro
   async handleQuoteAction(
     tweet: ActionableTweet,
     mediaDescriptions: string = "",
+    session?: TwitterAccountSession,
   ) {
     try {
       const message = this.formMessage(this.runtime, tweet);
@@ -605,13 +644,13 @@ ${tweet.text}${mediaDescriptions}`;
           return;
         }
 
-        const result = await this.client.requestQueue.add(
-          async () =>
-            await this.twitterClient.sendQuoteTweet(
-              String(responseObject.post),
-              tweet.id,
-            ),
-        );
+        const result = await this.client.requestQueue.add(async () => {
+          if (session) this.assertCurrentSession(session);
+          return await this.twitterClient.sendQuoteTweet(
+            String(responseObject.post),
+            tweet.id,
+          );
+        });
 
         const resultWithJson = result as { json: () => Promise<unknown> };
         const body = (await resultWithJson.json()) as {
@@ -665,6 +704,7 @@ ${tweet.text}${mediaDescriptions}`;
         await createMemorySafe(this.runtime, responseMemory, "messages");
       }
     } catch (error) {
+      if (isSessionRotation(error)) throw error;
       logger.error("Error in quote tweet generation:", errorMessage(error));
     }
   }
@@ -672,6 +712,7 @@ ${tweet.text}${mediaDescriptions}`;
   async handleReplyAction(
     tweet: ActionableTweet,
     mediaDescriptions: string = "",
+    session?: TwitterAccountSession,
   ) {
     try {
       const message = this.formMessage(this.runtime, tweet);
@@ -706,6 +747,7 @@ ${tweet.text}${mediaDescriptions}`;
           return;
         }
 
+        if (session) this.assertCurrentSession(session);
         const result = await sendTweet(
           this.client,
           String(responseObject.post),
@@ -749,6 +791,7 @@ ${tweet.text}${mediaDescriptions}`;
         }
       }
     } catch (error) {
+      if (isSessionRotation(error)) throw error;
       logger.error("Error in reply tweet generation:", errorMessage(error));
     }
   }

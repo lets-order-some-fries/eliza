@@ -69,57 +69,53 @@ export class TwitterMessageService implements IMessageService {
 
   async getMessages(options: GetMessagesOptions): Promise<Message[]> {
     try {
-      // Twitter doesn't have a direct way to get messages by room ID
-      // We'll need to use search to find related tweets/DMs
-      const username = this.client.profile?.username;
-      if (!username) {
-        logger.error("No Twitter profile available");
-        return [];
-      }
+      return await this.client.withAuthenticatedSession(async ({ profile }) => {
+        // Twitter doesn't have a direct way to get messages by room ID
+        // We'll need to use search to find related tweets/DMs
+        const searchResult = await this.client.fetchSearchTweets(
+          `@${profile.username}`,
+          options.limit || 20,
+          SearchMode.Latest,
+        );
 
-      // Search for mentions and replies
-      const searchResult = await this.client.fetchSearchTweets(
-        `@${username}`,
-        options.limit || 20,
-        SearchMode.Latest,
-      );
-
-      const messages: Message[] = searchResult.tweets.flatMap((tweet) => {
-        // Normalize once per row; rows without a usable identity or timestamp
-        // fail closed instead of surfacing as fresh messages (#18965).
-        const timestamp = getEpochMs(tweet.timestamp);
-        if (typeof tweet.id !== "string" || timestamp === undefined) return [];
-        const tweetId = tweet.id;
-        const conversationId = tweet.conversationId ?? tweetId;
-        if (options.roomId) {
-          const tweetRoomId = createUniqueUuid(
-            this.client.runtime,
-            conversationId,
-          );
-          if (tweetRoomId !== options.roomId) return [];
-        }
-        return [
-          {
-            id: tweetId,
-            agentId: this.client.runtime.agentId,
-            roomId: createUniqueUuid(this.client.runtime, conversationId),
-            userId: tweet.userId ?? "",
-            username: tweet.username ?? "",
-            text: tweet.text ?? "",
-            type: tweet.inReplyToStatusId
-              ? MessageType.REPLY
-              : MessageType.MENTION,
-            timestamp,
-            inReplyTo: tweet.inReplyToStatusId,
-            metadata: {
-              tweetId,
-              permanentUrl: tweet.permanentUrl,
+        const messages: Message[] = searchResult.tweets.flatMap((tweet) => {
+          // Normalize once per row; rows without a usable identity or timestamp
+          // fail closed instead of surfacing as fresh messages (#18965).
+          const timestamp = getEpochMs(tweet.timestamp);
+          if (typeof tweet.id !== "string" || timestamp === undefined)
+            return [];
+          const tweetId = tweet.id;
+          const conversationId = tweet.conversationId ?? tweetId;
+          if (options.roomId) {
+            const tweetRoomId = createUniqueUuid(
+              this.client.runtime,
+              conversationId,
+            );
+            if (tweetRoomId !== options.roomId) return [];
+          }
+          return [
+            {
+              id: tweetId,
+              agentId: this.client.runtime.agentId,
+              roomId: createUniqueUuid(this.client.runtime, conversationId),
+              userId: tweet.userId ?? "",
+              username: tweet.username ?? "",
+              text: tweet.text ?? "",
+              type: tweet.inReplyToStatusId
+                ? MessageType.REPLY
+                : MessageType.MENTION,
+              timestamp,
+              inReplyTo: tweet.inReplyToStatusId,
+              metadata: {
+                tweetId,
+                permanentUrl: tweet.permanentUrl,
+              },
             },
-          },
-        ];
-      });
+          ];
+        });
 
-      return messages;
+        return messages;
+      });
     } catch (error) {
       // error-policy:J7 a DM fetch failure must surface to the agent (RECENT_ERRORS)
       // rather than reading as an empty inbox; degrade to no messages after reporting.
@@ -129,49 +125,51 @@ export class TwitterMessageService implements IMessageService {
   }
 
   async sendMessage(options: SendMessageOptions): Promise<Message> {
-    try {
-      let result: unknown;
+    return this.client.withAuthenticatedSession(async ({ profile }) => {
+      try {
+        let result: unknown;
 
-      if (options.type === MessageType.DIRECT_MESSAGE) {
-        // Send direct message using the roomId as conversationId
-        result = await this.client.twitterClient.sendDirectMessage(
-          options.roomId.toString(),
-          options.text,
-        );
-      } else {
-        // Send tweet (reply, mention, or regular post)
-        result = await this.client.twitterClient.sendTweet(
-          options.text,
-          options.replyToId,
-        );
+        if (options.type === MessageType.DIRECT_MESSAGE) {
+          // Send direct message using the roomId as conversationId
+          result = await this.client.twitterClient.sendDirectMessage(
+            options.roomId.toString(),
+            options.text,
+          );
+        } else {
+          // Send tweet (reply, mention, or regular post)
+          result = await this.client.twitterClient.sendTweet(
+            options.text,
+            options.replyToId,
+          );
+        }
+
+        const extractedId = await this.extractResultId(result);
+        const resultId = (result as { id?: unknown } | null)?.id;
+        const messageId =
+          extractedId ?? (typeof resultId === "string" ? resultId : "");
+
+        const message: Message = {
+          id: messageId,
+          agentId: options.agentId,
+          roomId: options.roomId,
+          userId: profile.id,
+          username: profile.username,
+          text: options.text,
+          type: options.type,
+          timestamp: Date.now(),
+          inReplyTo: options.replyToId,
+          metadata: {
+            ...options.metadata,
+            result,
+          },
+        };
+
+        return message;
+      } catch (error) {
+        logger.error("Error sending message:", this.errorDetail(error));
+        throw error;
       }
-
-      const extractedId = await this.extractResultId(result);
-      const resultId = (result as { id?: unknown } | null)?.id;
-      const messageId =
-        extractedId ?? (typeof resultId === "string" ? resultId : "");
-
-      const message: Message = {
-        id: messageId,
-        agentId: options.agentId,
-        roomId: options.roomId,
-        userId: this.client.profile?.id || "",
-        username: this.client.profile?.username || "",
-        text: options.text,
-        type: options.type,
-        timestamp: Date.now(),
-        inReplyTo: options.replyToId,
-        metadata: {
-          ...options.metadata,
-          result,
-        },
-      };
-
-      return message;
-    } catch (error) {
-      logger.error("Error sending message:", this.errorDetail(error));
-      throw error;
-    }
+    });
   }
 
   async deleteMessage(messageId: string, _agentId: UUID): Promise<void> {

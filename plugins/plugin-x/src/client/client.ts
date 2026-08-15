@@ -9,6 +9,7 @@
  * with caching and runtime-memory bookkeeping.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { logger } from "@elizaos/core";
 import type {
   TTweetv2Expansion,
@@ -111,6 +112,7 @@ export interface ClientOptions {
  */
 export class Client {
   private auth?: TwitterAuth;
+  private readonly authContext = new AsyncLocalStorage<TwitterAuth>();
 
   /**
    * Creates a new Client object.
@@ -119,10 +121,11 @@ export class Client {
   constructor(readonly _options?: Partial<ClientOptions>) {}
 
   private requireAuth(): TwitterAuth {
-    if (!this.auth) {
+    const auth = this.authContext.getStore() ?? this.auth;
+    if (!auth) {
       throw new Error("Not authenticated");
     }
-    return this.auth;
+    return auth;
   }
 
   /**
@@ -131,6 +134,44 @@ export class Client {
    */
   public async getV2Client() {
     return this.requireAuth().getV2Client();
+  }
+
+  /** Returns a profile and API client from one credential generation. */
+  public async getAuthenticatedSession() {
+    return this.requireAuth().getAuthenticatedSession();
+  }
+
+  /** Keeps credential resolution pinned while an identity-sensitive operation runs. */
+  public async withAuthenticatedSession<T>(
+    operation: (
+      session: Awaited<ReturnType<TwitterAuth["getAuthenticatedSession"]>>,
+    ) => Promise<T>,
+  ): Promise<T> {
+    const auth = this.requireAuth();
+    return auth.withAuthenticatedSession((session) =>
+      this.authContext.run(auth, () => operation(session)),
+    );
+  }
+
+  /** Checks whether a captured session is still the active credential generation. */
+  public isAuthenticatedSessionCurrent(
+    session: Pick<
+      Awaited<ReturnType<TwitterAuth["getAuthenticatedSession"]>>,
+      "client" | "revision"
+    >,
+  ): boolean {
+    return this.requireAuth().isAuthenticatedSessionCurrent(session);
+  }
+
+  /** Publishes derived identity only while its credential generation is current. */
+  public async withCurrentSession<T>(
+    session: Pick<
+      Awaited<ReturnType<TwitterAuth["getAuthenticatedSession"]>>,
+      "client" | "revision"
+    >,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return this.requireAuth().withCurrentSession(session, operation);
   }
 
   /**
@@ -764,15 +805,14 @@ export class Client {
    * @param auth The new authentication.
    */
   public updateAuth(auth: TwitterAuth) {
+    if (this.auth === auth) return;
+    this.auth?.invalidate();
     this.auth = auth;
   }
 
   public async authenticate(provider: TwitterAuthProvider): Promise<void> {
+    this.auth?.invalidate();
     this.auth = new TwitterAuth(provider);
-    // Force initialization early to surface misconfiguration quickly.
-    // isLoggedIn is itself an availability probe (returns false, never rejects),
-    // so no swallowing wrapper is needed here.
-    await this.requireAuth().isLoggedIn();
   }
 
   /**
@@ -847,18 +887,15 @@ export class Client {
         accessSecret: resolvedAccessSecret,
       }),
     };
+    this.auth?.invalidate();
     this.auth = new TwitterAuth(provider);
   }
 
-  /**
-   * Log out of Twitter.
-   * Note: With API v2, logout is not applicable as we use API credentials.
-   */
+  /** Invalidates the local authenticated client and all derived identity. */
   public async logout(): Promise<void> {
-    // With API v2 credentials, there's no logout process.
-    logger.warn(
-      "[X.Client] Logout is not applicable when using Twitter API v2 credentials",
-    );
+    const auth = this.auth;
+    this.auth = undefined;
+    await auth?.logout();
   }
 
   /**

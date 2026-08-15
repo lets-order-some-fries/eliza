@@ -16,6 +16,7 @@ import {
   ChannelType,
   type Content,
   createUniqueUuid,
+  ElizaError,
   type IAgentRuntime,
   logger,
   type Memory,
@@ -492,8 +493,36 @@ export class XService extends Service {
     const loadedClient =
       this.accountClients.get(accountId) ??
       (this.twitterClient?.accountId === accountId ? this.twitterClient : null);
-    const profile = loadedClient?.client.profile;
     const { capabilities, scopes } = capabilitiesForXAuthState(state);
+    let profile: TwitterProfile | null = null;
+    if (loadedClient) {
+      try {
+        profile = await loadedClient.client.getAuthenticatedProfile();
+      } catch (error) {
+        // error-policy:J4 account status translates an authentication refresh
+        // failure into the explicit needs-reauth state rather than stale identity.
+        if (
+          !(error instanceof ElizaError) ||
+          !["X_AUTH_REJECTED", "X_AUTH_NOT_INITIALIZED"].includes(error.code)
+        ) {
+          throw error;
+        }
+        logger.warn(
+          { accountId },
+          "[XService] Authenticated profile refresh failed",
+        );
+        return {
+          accountId,
+          configured: true,
+          connected: false,
+          reason: "needs_reauth",
+          identity: null,
+          grantedCapabilities: [],
+          grantedScopes: [],
+          authMode,
+        };
+      }
+    }
     return {
       accountId,
       configured: true,
@@ -526,6 +555,16 @@ export class XService extends Service {
       this.accountClients.get(accountId) ??
       (this.twitterClient?.accountId === accountId ? this.twitterClient : null);
     return loadedClient?.client.profile ?? null;
+  }
+
+  async refreshActiveProfile(
+    accountIdInput: string = this.defaultAccountId,
+  ): Promise<TwitterProfile | null> {
+    const accountId = this.resolveAccountId(accountIdInput);
+    const loadedClient =
+      this.accountClients.get(accountId) ??
+      (this.twitterClient?.accountId === accountId ? this.twitterClient : null);
+    return loadedClient ? loadedClient.client.getAuthenticatedProfile() : null;
   }
 
   private async startAutonomousClients(
@@ -783,34 +822,38 @@ export class XService extends Service {
       content,
     );
     const base = (await this.getTwitterClientForAccount(accountId)).client;
+    return base.withAuthenticatedSession(async ({ profile }) => {
+      const replyToTweetId = readContentString(content, [
+        "replyToTweetId",
+        "replyTo",
+        "inReplyToTweetId",
+      ]);
+      const postService = new TwitterPostService(base);
+      const post = await postService.createPost(
+        {
+          agentId: runtime.agentId,
+          roomId: createUniqueUuid(
+            runtime,
+            `x:${accountId}:feed:${profile.id}`,
+          ),
+          text,
+          ...(replyToTweetId ? { inReplyTo: replyToTweetId } : {}),
+        },
+        profile,
+      );
 
-    const replyToTweetId = readContentString(content, [
-      "replyToTweetId",
-      "replyTo",
-      "inReplyToTweetId",
-    ]);
-    const postService = new TwitterPostService(base);
-    const post = await postService.createPost({
-      agentId: runtime.agentId,
-      roomId: createUniqueUuid(
-        runtime,
-        `x:${accountId}:feed:${base.profile?.id ?? runtime.agentId}`,
-      ),
-      text,
-      ...(replyToTweetId ? { inReplyTo: replyToTweetId } : {}),
-    });
-
-    return this.buildXPostMemory(runtime, {
-      id: post.id,
-      userId: post.userId || runtime.agentId,
-      username: post.username || base.profile?.username || "agent",
-      text: post.text,
-      createdAt: post.timestamp,
-      inReplyTo: post.inReplyTo,
-      roomId: post.roomId,
-      metadata: post.metadata,
-      metrics: post.metrics,
-      accountId,
+      return this.buildXPostMemory(runtime, {
+        id: post.id,
+        userId: post.userId,
+        username: post.username,
+        text: post.text,
+        createdAt: post.timestamp,
+        inReplyTo: post.inReplyTo,
+        roomId: post.roomId,
+        metadata: post.metadata,
+        metrics: post.metrics,
+        accountId,
+      });
     });
   }
 
@@ -1309,68 +1352,70 @@ export class XService extends Service {
     }>
   > {
     const base = (await this.getTwitterClientForAccount(accountId)).client;
-    const client = await this.getV2DmClient(accountId);
-    const ownUserId = base.profile?.id ?? null;
-    const iterator = client.v2.listDmEvents?.({
-      max_results: Math.min(Math.max(1, limit), 50),
-      "dm_event.fields": [
-        "id",
-        "created_at",
-        "dm_conversation_id",
-        "sender_id",
-        "text",
-        "event_type",
-        "participant_ids",
-      ],
-      "user.fields": ["id", "username"],
-      expansions: ["sender_id"],
-      event_types: ["MessageCreate"],
-    });
-    if (!iterator) {
-      return [];
-    }
-
-    const usernameMap = new Map<string, string>();
-    for (const user of iterator.includes?.users ?? []) {
-      if (user.id && user.username) {
-        usernameMap.set(user.id, user.username);
-      }
-    }
-
-    const messages: Array<{
-      id: string;
-      conversationId: string;
-      senderId: string;
-      senderUsername: string | null;
-      text: string;
-      createdAt: string | null;
-      isInbound: boolean;
-      participantIds: string[];
-    }> = [];
-    for await (const event of iterator) {
-      if (event.event_type && event.event_type !== "MessageCreate") {
-        continue;
-      }
-      messages.push({
-        id: event.id ?? "",
-        conversationId: event.dm_conversation_id ?? event.id ?? "",
-        senderId: event.sender_id ?? "",
-        senderUsername: event.sender_id
-          ? (usernameMap.get(event.sender_id) ?? null)
-          : null,
-        text: event.text ?? "",
-        createdAt: event.created_at ?? null,
-        isInbound:
-          ownUserId && event.sender_id ? event.sender_id !== ownUserId : true,
-        participantIds: Array.isArray(event.participant_ids)
-          ? event.participant_ids
-          : [],
+    return base.withAuthenticatedSession(async ({ client, profile }) => {
+      const iterator = await client.v2.listDmEvents?.({
+        max_results: Math.min(Math.max(1, limit), 50),
+        "dm_event.fields": [
+          "id",
+          "created_at",
+          "dm_conversation_id",
+          "sender_id",
+          "text",
+          "event_type",
+          "participant_ids",
+        ],
+        "user.fields": ["id", "username"],
+        expansions: ["sender_id"],
+        event_types: ["MessageCreate"],
       });
-      if (messages.length >= limit) {
-        break;
+      if (!iterator) {
+        return [];
       }
-    }
-    return messages;
+
+      const usernameMap = new Map<string, string>();
+      for (const user of iterator.includes?.users ?? []) {
+        if (user.id && user.username) {
+          usernameMap.set(user.id, user.username);
+        }
+      }
+
+      const messages: Array<{
+        id: string;
+        conversationId: string;
+        senderId: string;
+        senderUsername: string | null;
+        text: string;
+        createdAt: string | null;
+        isInbound: boolean;
+        participantIds: string[];
+      }> = [];
+      for await (const event of iterator) {
+        if (event.event_type && event.event_type !== "MessageCreate") {
+          continue;
+        }
+        messages.push({
+          id: event.id ?? "",
+          conversationId: event.dm_conversation_id ?? event.id ?? "",
+          senderId: event.sender_id ?? "",
+          senderUsername: event.sender_id
+            ? (usernameMap.get(event.sender_id) ?? null)
+            : null,
+          text: event.text ?? "",
+          createdAt: event.created_at ?? null,
+          isInbound:
+            profile.id && event.sender_id
+              ? event.sender_id !== profile.id
+              : true,
+          participantIds: Array.isArray(event.participant_ids)
+            ? event.participant_ids
+            : [],
+        });
+        if (messages.length >= limit) {
+          break;
+        }
+      }
+      return messages;
+    });
   }
 
   /**

@@ -45,15 +45,31 @@ function rawTweet(overrides: Record<string, unknown> = {}) {
 }
 
 function createClient(overrides: Record<string, unknown> = {}): ClientBase {
-  return {
+  const client = {
     accountId: "default",
     runtime: createRuntime(),
     profile: { id: "bot-user", username: "bot" },
+    getAuthenticatedProfile: vi.fn(async () => ({
+      id: "bot-user",
+      username: "bot",
+      screenName: "Bot",
+      bio: "",
+      nicknames: [],
+    })),
     twitterClient: {},
     fetchSearchTweets: vi.fn(),
     fetchHomeTimeline: vi.fn(async () => []),
     ...overrides,
   } as unknown as ClientBase;
+  if (!("withAuthenticatedSession" in overrides)) {
+    client.withAuthenticatedSession = async (operation) =>
+      operation({
+        client: client.twitterClient as never,
+        profile: await client.getAuthenticatedProfile(),
+        revision: 1,
+      });
+  }
+  return client;
 }
 
 describe("TwitterPostService mixed valid+corrupt collections (#18965)", () => {
@@ -118,6 +134,43 @@ describe("TwitterMessageService mixed valid+corrupt collections (#18965)", () =>
     expect(messages.map((m) => m.id)).toEqual(["valid-1"]);
     expect(messages[0].timestamp).toBe(VALID_MS);
     expect(messages[0].type).toBe(MessageType.REPLY);
+  });
+
+  it("uses refreshed identity for mention queries and outbound attribution", async () => {
+    const fetchSearchTweets = vi.fn(async () => ({ tweets: [] }));
+    const sendTweet = vi.fn(async () => ({ id: "message-b" }));
+    const client = createClient({
+      profile: { id: "account-a", username: "stale-a" },
+      getAuthenticatedProfile: vi.fn(async () => ({
+        id: "account-b",
+        username: "current-b",
+        screenName: "Current B",
+        bio: "",
+        nicknames: [],
+      })),
+      fetchSearchTweets,
+      twitterClient: { sendTweet },
+    });
+    const service = new TwitterMessageService(client);
+
+    await service.getMessages({ roomId: undefined as unknown as UUID });
+    const sent = await service.sendMessage({
+      agentId: "00000000-0000-0000-0000-000000000001" as UUID,
+      roomId: "00000000-0000-0000-0000-000000000002" as UUID,
+      text: "hello",
+      type: MessageType.POST,
+    });
+
+    expect(fetchSearchTweets).toHaveBeenCalledWith(
+      "@current-b",
+      20,
+      expect.anything(),
+    );
+    expect(sent).toMatchObject({
+      id: "message-b",
+      userId: "account-b",
+      username: "current-b",
+    });
   });
 });
 

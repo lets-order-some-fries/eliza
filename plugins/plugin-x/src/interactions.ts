@@ -20,7 +20,7 @@ import {
   ModelType,
   parseJSONObjectFromText,
 } from "@elizaos/core";
-import type { ClientBase } from "./base";
+import type { ClientBase, TwitterProfile } from "./base";
 import { SearchMode } from "./client/index";
 import type { Tweet as ClientTweet } from "./client/tweets";
 import {
@@ -240,46 +240,41 @@ export class TwitterInteractionClient {
   async handleTwitterInteractions() {
     logger.log("Checking Twitter interactions");
 
-    const twitterUsername = this.client.profile?.username;
-
     try {
-      // Check for mentions first (replies enabled by default)
-      const repliesEnabled =
-        (getSetting(this.runtime, "TWITTER_ENABLE_REPLIES") ??
-          process.env.TWITTER_ENABLE_REPLIES) !== "false";
+      await this.client.withAuthenticatedSession(async ({ profile }) => {
+        // Check for mentions first (replies enabled by default)
+        const repliesEnabled =
+          (getSetting(this.runtime, "TWITTER_ENABLE_REPLIES") ??
+            process.env.TWITTER_ENABLE_REPLIES) !== "false";
 
-      if (repliesEnabled && twitterUsername) {
-        await this.handleMentions(twitterUsername);
-      } else if (repliesEnabled) {
-        logger.warn(
-          "Skipping Twitter mentions: profile username is unavailable",
-        );
-      }
+        if (repliesEnabled) {
+          await this.handleMentions(profile);
+        }
 
-      // Check target users' posts for autonomous engagement
-      const targetUsersConfig =
-        ((getSetting(this.runtime, "TWITTER_TARGET_USERS") ??
-          process.env.TWITTER_TARGET_USERS) as string) || "";
+        // Check target users' posts for autonomous engagement
+        const targetUsersConfig =
+          ((getSetting(this.runtime, "TWITTER_TARGET_USERS") ??
+            process.env.TWITTER_TARGET_USERS) as string) || "";
 
-      if (targetUsersConfig?.trim()) {
-        await this.handleTargetUserPosts(targetUsersConfig);
-      }
+        if (targetUsersConfig?.trim()) {
+          await this.handleTargetUserPosts(targetUsersConfig);
+        }
 
-      // Save the latest checked tweet ID to the file
-      await this.client.cacheLatestCheckedTweetId();
-
-      logger.log("Finished checking Twitter interactions");
+        await this.client.cacheLatestCheckedTweetId(profile);
+        logger.log("Finished checking Twitter interactions");
+      });
     } catch (error) {
-      logger.error("Error handling Twitter interactions:", errorMessage(error));
+      this.runtime.reportError("XInteractionClient.handleInteractions", error);
     }
   }
 
   /**
    * Handle mentions and replies
    */
-  private async handleMentions(twitterUsername: string) {
+  private async handleMentions(profile: TwitterProfile) {
     try {
       // Check for mentions
+      const twitterUsername = profile.username;
       const cursorKey = `twitter/${twitterUsername}/mention_cursor`;
       const cachedCursor =
         (await this.runtime.getCache<string>(cursorKey)) ?? "";
@@ -301,7 +296,7 @@ export class TwitterInteractionClient {
         await this.runtime.setCache(cursorKey, "");
       }
 
-      await this.processMentionTweets(mentionCandidates);
+      await this.processMentionTweets(mentionCandidates, profile);
     } catch (error) {
       logger.error("Error handling mentions:", errorMessage(error));
     }
@@ -733,7 +728,16 @@ ${tweet.text}`;
    *
    * Note: MENTION_RECEIVED event emission is currently disabled.
    */
-  async processMentionTweets(mentionCandidates: ClientTweet[]) {
+  async processMentionTweets(
+    mentionCandidates: ClientTweet[],
+    authenticatedProfile?: TwitterProfile,
+  ): Promise<void> {
+    if (!authenticatedProfile) {
+      return this.client.withAuthenticatedSession(({ profile }) =>
+        this.processMentionTweets(mentionCandidates, profile),
+      );
+    }
+    const profile = authenticatedProfile;
     logger.log(
       "Completed checking mentioned tweets:",
       mentionCandidates.length.toString(),
@@ -741,7 +745,7 @@ ${tweet.text}`;
     let uniqueTweetCandidates = mentionCandidates
       .map((tweet) => normalizeTweet(tweet))
       .filter((tweet): tweet is ProcessableTweet => tweet !== null);
-    const profileId = this.client.profile?.id;
+    const profileId = profile.id;
 
     // Sort tweet candidates by ID in ascending order
     uniqueTweetCandidates = uniqueTweetCandidates
@@ -854,9 +858,10 @@ ${tweet.text}`;
 
     // for each tweet candidate, handle the tweet
     for (const tweet of tweetsToProcess) {
+      const lastCheckedTweetId = this.client.getLatestCheckedTweetId(profileId);
       if (
-        !this.client.lastCheckedTweetId ||
-        BigInt(tweet.id) > this.client.lastCheckedTweetId
+        lastCheckedTweetId === null ||
+        BigInt(tweet.id) > lastCheckedTweetId
       ) {
         // Generate the tweetId UUID the same way it's done in handleTweet
         const tweetId = createUniqueUuid(this.runtime, tweet.id);
@@ -1019,7 +1024,7 @@ ${tweet.text}`;
         });
 
         // Update the last checked tweet ID after processing each tweet
-        this.client.lastCheckedTweetId = BigInt(tweet.id);
+        this.client.recordLatestCheckedTweetId(profileId, BigInt(tweet.id));
       }
     }
   }
