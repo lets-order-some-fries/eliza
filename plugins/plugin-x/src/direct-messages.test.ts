@@ -16,6 +16,14 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((onResolve) => {
+    resolve = onResolve;
+  });
+  return { promise, resolve };
+}
+
 const defaultProfile: TwitterProfile = {
   id: "agent-user-id",
   username: "elizamakesmagic",
@@ -30,6 +38,9 @@ function createDmClient(
     profile?: TwitterProfile;
     snapshot?: Pick<TwitterProfile, "id" | "username">;
     getSession?: () => Promise<TwitterAccountSession>;
+    withSession?: <T>(
+      operation: (session: TwitterAccountSession) => Promise<T>,
+    ) => Promise<T>;
     isCurrent?: (session: TwitterAccountSession) => boolean;
   } = {},
 ): ClientBase {
@@ -39,10 +50,16 @@ function createDmClient(
     profile,
     revision: 1,
   };
+  const getAuthenticatedSession = options.getSession ?? (async () => session);
   return {
     accountId: "agent",
     profile: options.snapshot ?? profile,
-    getAuthenticatedSession: options.getSession ?? (async () => session),
+    getAuthenticatedSession,
+    withAuthenticatedSession:
+      options.withSession ??
+      (async <T>(
+        operation: (activeSession: TwitterAccountSession) => Promise<T>,
+      ) => operation(await getAuthenticatedSession())),
     isAuthenticatedSessionCurrent: options.isCurrent ?? (() => true),
   } as unknown as ClientBase;
 }
@@ -311,8 +328,8 @@ describe("TwitterDirectMessageClient", () => {
     await vi.advanceTimersByTimeAsync(15_000);
     expect(handleMessage).toHaveBeenCalledTimes(1);
     const connection = vi.mocked(runtime.ensureConnection).mock.calls[0]?.[0];
-    expect(connection?.entityId).toBe(connection?.userId);
-    expect(connection?.userId).not.toBe("person-1");
+    expect(connection?.entityId).not.toBe("person-1");
+    expect(connection?.userId).toBe("person-1");
     const world = vi.mocked(runtime.ensureWorldExists).mock.calls[0]?.[0];
     expect(world?.id).toBe(connection?.worldId);
     expect(world?.metadata?.ownership?.ownerId).toBe(connection?.entityId);
@@ -1020,6 +1037,240 @@ describe("TwitterDirectMessageClient", () => {
     expect(cache.get("twitter/agent/agent-user-id/dm_settled/801")).toBe(
       "delivered:reply-801",
     );
+    await dmClient.stop();
+  });
+
+  it("holds one authenticated session across inbox read, model handling, and reply egress", async () => {
+    vi.useFakeTimers();
+    let insideSession = false;
+    const event = {
+      id: "901",
+      sender_id: "person-1",
+      dm_conversation_id: "conversation-1",
+      text: "one generation",
+      event_type: "MessageCreate",
+    };
+    const listDmEvents = vi.fn(async () => {
+      expect(insideSession).toBe(true);
+      return { events: [event] };
+    });
+    const sendDmToParticipant = vi.fn(async () => {
+      expect(insideSession).toBe(true);
+      return { data: { dm_event_id: "reply-901" } };
+    });
+    const session: TwitterAccountSession = {
+      client: {
+        v2: { listDmEvents, sendDmToParticipant },
+      } as TwitterAccountSession["client"],
+      profile: defaultProfile,
+      revision: 9,
+    };
+    const withSession = vi.fn(
+      async <T>(
+        operation: (activeSession: TwitterAccountSession) => Promise<T>,
+      ) => {
+        expect(insideSession).toBe(false);
+        insideSession = true;
+        try {
+          return await operation(session);
+        } finally {
+          insideSession = false;
+        }
+      },
+    );
+    const cache = new Map<string, string>([
+      ["twitter/agent/agent-user-id/dm_cursor", "900"],
+    ]);
+    const runtime = {
+      agentId: "00000000-0000-0000-0000-000000000001",
+      getCache: async (key: string) => cache.get(key),
+      setCache: async (key: string, value: string) => cache.set(key, value),
+      deleteCache: async (key: string) => cache.delete(key),
+      getMemoryById: async () => null,
+      createMemory: vi.fn(async () => undefined),
+      ensureWorldExists: vi.fn(async () => undefined),
+      updateWorld: vi.fn(async () => undefined),
+      ensureRoomExists: vi.fn(async () => undefined),
+      ensureConnection: vi.fn(async () => undefined),
+      messageService: {
+        handleMessage: vi.fn(
+          async (
+            _runtime: IAgentRuntime,
+            _memory: Memory,
+            callback: (response: { text: string }) => Promise<Memory[]>,
+          ) => {
+            expect(insideSession).toBe(true);
+            await callback({ text: "same session" });
+          },
+        ),
+      },
+      reportError: vi.fn(),
+      getSetting: vi.fn(() => null),
+    } as unknown as IAgentRuntime;
+    const client = createDmClient(session.client, { withSession });
+    const dmClient = new TwitterDirectMessageClient(client, runtime, {
+      TWITTER_DRY_RUN: "false",
+      TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
+    } as unknown as TwitterClientState);
+
+    await dmClient.start();
+
+    expect(withSession).toHaveBeenCalledTimes(1);
+    expect(listDmEvents).toHaveBeenCalledTimes(1);
+    expect(sendDmToParticipant).toHaveBeenCalledTimes(1);
+    expect(cache.get("twitter/agent/agent-user-id/dm_cursor")).toBe("901");
+    expect(insideSession).toBe(false);
+    await dmClient.stop();
+  });
+
+  it("does not send or advance the cursor when credentials rotate while the personal router is pending", async () => {
+    vi.useFakeTimers();
+    const routeResponse = deferred<Response>();
+    const fetchMock = vi.fn(() => routeResponse.promise);
+    vi.stubGlobal("fetch", fetchMock);
+    let current = true;
+    const event = {
+      id: "951",
+      sender_id: "person-1",
+      dm_conversation_id: "conversation-1",
+      text: "route under A",
+      event_type: "MessageCreate",
+    };
+    const sendA = vi.fn();
+    const sendB = vi.fn();
+    const cache = new Map<string, string>([
+      ["twitter/agent/agent-user-id/dm_cursor", "950"],
+    ]);
+    const runtime = {
+      agentId: "00000000-0000-0000-0000-000000000001",
+      getCache: async (key: string) => cache.get(key),
+      setCache: async (key: string, value: string) => cache.set(key, value),
+      deleteCache: async (key: string) => cache.delete(key),
+      getMemoryById: async () => null,
+      createMemory: vi.fn(async () => undefined),
+      ensureWorldExists: vi.fn(async () => undefined),
+      updateWorld: vi.fn(async () => undefined),
+      ensureRoomExists: vi.fn(async () => undefined),
+      ensureConnection: vi.fn(async () => undefined),
+      reportError: vi.fn(),
+      getSetting: vi.fn((key: string) =>
+        key === "TWITTER_BROKER_TOKEN" ? "router-token" : null,
+      ),
+    } as unknown as IAgentRuntime;
+    const client = createDmClient(
+      {
+        v2: {
+          listDmEvents: async () => ({ events: [event] }),
+          sendDmToParticipant: sendA,
+        },
+      },
+      { isCurrent: () => current },
+    );
+    const dmClient = new TwitterDirectMessageClient(client, runtime, {
+      TWITTER_DRY_RUN: "false",
+      TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
+      TWITTER_PERSONAL_DM_ROUTER_URL:
+        "https://cloud.eliza.app/api/v1/twitter/personal-message",
+    } as unknown as TwitterClientState);
+
+    const poll = dmClient.start();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    current = false;
+    client.twitterClient = {
+      v2: { sendDmToParticipant: sendB },
+    } as unknown as ClientBase["twitterClient"];
+    routeResponse.resolve(
+      new Response(
+        JSON.stringify({ success: true, data: { reply: "reply under B" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    await poll;
+
+    expect(sendA).not.toHaveBeenCalled();
+    expect(sendB).not.toHaveBeenCalled();
+    expect(cache.get("twitter/agent/agent-user-id/dm_cursor")).toBe("950");
+    expect(runtime.reportError).toHaveBeenCalledWith(
+      "XDirectMessages.poll",
+      expect.objectContaining({ code: "X_AUTH_SESSION_ROTATED" }),
+      { accountId: "agent" },
+    );
+    await dmClient.stop();
+  });
+
+  it("surfaces a rejected pre-egress tombstone write even when the message service swallows callback errors", async () => {
+    vi.useFakeTimers();
+    const event = {
+      id: "1001",
+      sender_id: "person-1",
+      dm_conversation_id: "conversation-1",
+      text: "persist before send",
+      event_type: "MessageCreate",
+    };
+    const cache = new Map<string, string>([
+      ["twitter/agent/agent-user-id/dm_cursor", "1000"],
+    ]);
+    let rejectTombstone = true;
+    const setCache = vi.fn(async (key: string, value: string) => {
+      if (key.endsWith("/dm_settled/1001") && value === "egress_started") {
+        if (rejectTombstone) {
+          rejectTombstone = false;
+          throw new Error("durable cache unavailable");
+        }
+      }
+      cache.set(key, value);
+    });
+    const sendDmToParticipant = vi.fn(async () => ({
+      data: { dm_event_id: "reply-1001" },
+    }));
+    const handleMessage = vi.fn(
+      async (
+        _runtime: IAgentRuntime,
+        _memory: Memory,
+        callback: (response: { text: string }) => Promise<Memory[]>,
+      ) => {
+        await callback({ text: "only after durable claim" }).catch(() => []);
+      },
+    );
+    const runtime = {
+      agentId: "00000000-0000-0000-0000-000000000001",
+      getCache: async (key: string) => cache.get(key),
+      setCache,
+      deleteCache: async (key: string) => cache.delete(key),
+      getMemoryById: async () => null,
+      createMemory: vi.fn(async () => undefined),
+      ensureWorldExists: vi.fn(async () => undefined),
+      updateWorld: vi.fn(async () => undefined),
+      ensureRoomExists: vi.fn(async () => undefined),
+      ensureConnection: vi.fn(async () => undefined),
+      messageService: { handleMessage },
+      reportError: vi.fn(),
+      getSetting: vi.fn(() => null),
+    } as unknown as IAgentRuntime;
+    const client = createDmClient({
+      v2: {
+        listDmEvents: async () => ({ events: [event] }),
+        sendDmToParticipant,
+      },
+    });
+    const dmClient = new TwitterDirectMessageClient(client, runtime, {
+      TWITTER_DRY_RUN: "false",
+      TWITTER_DM_POLL_INTERVAL_SECONDS: "15",
+    } as unknown as TwitterClientState);
+
+    await dmClient.start();
+
+    expect(sendDmToParticipant).not.toHaveBeenCalled();
+    expect(cache.get("twitter/agent/agent-user-id/dm_cursor")).toBe("1000");
+    expect(runtime.reportError).toHaveBeenCalledWith(
+      "XDirectMessages.poll",
+      expect.objectContaining({ message: "durable cache unavailable" }),
+      { accountId: "agent" },
+    );
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(sendDmToParticipant).toHaveBeenCalledTimes(1);
+    expect(cache.get("twitter/agent/agent-user-id/dm_cursor")).toBe("1001");
     await dmClient.stop();
   });
 });

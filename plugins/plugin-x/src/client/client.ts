@@ -10,7 +10,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { logger } from "@elizaos/core";
+import { ElizaError, logger } from "@elizaos/core";
 import type {
   TTweetv2Expansion,
   TTweetv2MediaField,
@@ -19,6 +19,7 @@ import type {
   TTweetv2TweetField,
   TTweetv2UserField,
 } from "twitter-api-v2";
+import { normalizeXReceiptId } from "../utils/provider-receipt";
 import type {
   FetchTransformOptions,
   QueryProfilesResponse,
@@ -106,13 +107,18 @@ export interface ClientOptions {
   transform: Partial<FetchTransformOptions>;
 }
 
+type ClientAuthContext = {
+  auth: TwitterAuth;
+  active: boolean;
+};
+
 /**
  * An interface to Twitter's API v2.
  * - Reusing Client objects is recommended to minimize the time spent authenticating unnecessarily.
  */
 export class Client {
   private auth?: TwitterAuth;
-  private readonly authContext = new AsyncLocalStorage<TwitterAuth>();
+  private readonly authContext = new AsyncLocalStorage<ClientAuthContext>();
 
   /**
    * Creates a new Client object.
@@ -121,7 +127,8 @@ export class Client {
   constructor(readonly _options?: Partial<ClientOptions>) {}
 
   private requireAuth(): TwitterAuth {
-    const auth = this.authContext.getStore() ?? this.auth;
+    const context = this.authContext.getStore();
+    const auth = (context?.active ? context.auth : undefined) ?? this.auth;
     if (!auth) {
       throw new Error("Not authenticated");
     }
@@ -131,12 +138,17 @@ export class Client {
   /**
    * Returns the authenticated API v2 client for connector-level capabilities
    * that are not yet wrapped by this class, such as DM event polling.
+   * @deprecated Raw clients cannot retain a replacement lease. Run provider
+   * work inside {@link withAuthenticatedSession} instead.
    */
   public async getV2Client() {
     return this.requireAuth().getV2Client();
   }
 
-  /** Returns a profile and API client from one credential generation. */
+  /**
+   * Returns a point-in-time profile and API client snapshot.
+   * @deprecated Use {@link withAuthenticatedSession} so the lease covers work.
+   */
   public async getAuthenticatedSession() {
     return this.requireAuth().getAuthenticatedSession();
   }
@@ -148,9 +160,32 @@ export class Client {
     ) => Promise<T>,
   ): Promise<T> {
     const auth = this.requireAuth();
-    return auth.withAuthenticatedSession((session) =>
-      this.authContext.run(auth, () => operation(session)),
-    );
+    return auth.withAuthenticatedSession(async (session) => {
+      const context: ClientAuthContext = { auth, active: true };
+      try {
+        return await this.authContext.run(context, () => operation(session));
+      } finally {
+        context.active = false;
+      }
+    });
+  }
+
+  private authenticatedGenerator<T>(
+    operation: (auth: TwitterAuth) => AsyncIterable<T>,
+  ): AsyncGenerator<T, void> {
+    const client = this;
+    return (async function* () {
+      // Public generator limits are bounded. Collecting under one lease avoids
+      // mixing account generations between lazily fetched pages.
+      const values = await client.withAuthenticatedSession(async () => {
+        const collected: T[] = [];
+        for await (const value of operation(client.requireAuth())) {
+          collected.push(value);
+        }
+        return collected;
+      });
+      yield* values;
+    })();
   }
 
   /** Checks whether a captured session is still the active credential generation. */
@@ -160,7 +195,9 @@ export class Client {
       "client" | "revision"
     >,
   ): boolean {
-    return this.requireAuth().isAuthenticatedSessionCurrent(session);
+    const context = this.authContext.getStore();
+    const auth = (context?.active ? context.auth : undefined) ?? this.auth;
+    return auth ? auth.isAuthenticatedSessionCurrent(session) : false;
   }
 
   /** Publishes derived identity only while its credential generation is current. */
@@ -180,8 +217,10 @@ export class Client {
    * @returns The requested {@link Profile}.
    */
   public async getProfile(username: string): Promise<Profile> {
-    const res = await getProfile(username, this.requireAuth());
-    return this.handleResponse(res);
+    return this.withAuthenticatedSession(async () => {
+      const res = await getProfile(username, this.requireAuth());
+      return this.handleResponse(res);
+    });
   }
 
   /**
@@ -190,8 +229,10 @@ export class Client {
    * @returns The ID of the corresponding account.
    */
   public async getEntityIdByScreenName(screenName: string): Promise<string> {
-    const res = await getEntityIdByScreenName(screenName, this.requireAuth());
-    return this.handleResponse(res);
+    return this.withAuthenticatedSession(async () => {
+      const res = await getEntityIdByScreenName(screenName, this.requireAuth());
+      return this.handleResponse(res);
+    });
   }
 
   /**
@@ -200,8 +241,10 @@ export class Client {
    * @returns The screen name of the corresponding account.
    */
   public async getScreenNameByUserId(userId: string): Promise<string> {
-    const response = await getScreenNameByUserId(userId, this.requireAuth());
-    return this.handleResponse(response);
+    return this.withAuthenticatedSession(async () => {
+      const response = await getScreenNameByUserId(userId, this.requireAuth());
+      return this.handleResponse(response);
+    });
   }
 
   /**
@@ -217,7 +260,9 @@ export class Client {
     maxTweets: number,
     searchMode: SearchMode = SearchMode.Top,
   ): AsyncGenerator<Tweet, void> {
-    return searchTweets(query, maxTweets, searchMode, this.requireAuth());
+    return this.authenticatedGenerator((auth) =>
+      searchTweets(query, maxTweets, searchMode, auth),
+    );
   }
 
   /**
@@ -230,7 +275,9 @@ export class Client {
     query: string,
     maxProfiles: number,
   ): AsyncGenerator<Profile, void> {
-    return searchProfiles(query, maxProfiles, this.requireAuth());
+    return this.authenticatedGenerator((auth) =>
+      searchProfiles(query, maxProfiles, auth),
+    );
   }
 
   /**
@@ -248,24 +295,25 @@ export class Client {
     searchMode: SearchMode,
     _cursor?: string,
   ): Promise<QueryTweetsResponse> {
-    // Use the generator and collect results
-    const tweets: Tweet[] = [];
-    const generator = searchTweets(
-      query,
-      maxTweets,
-      searchMode,
-      this.requireAuth(),
-    );
+    return this.withAuthenticatedSession(async () => {
+      const tweets: Tweet[] = [];
+      const generator = searchTweets(
+        query,
+        maxTweets,
+        searchMode,
+        this.requireAuth(),
+      );
 
-    for await (const tweet of generator) {
-      tweets.push(tweet);
-    }
+      for await (const tweet of generator) {
+        tweets.push(tweet);
+      }
 
-    return {
-      tweets,
-      // v2 API doesn't provide cursor-based pagination for search
-      next: undefined,
-    };
+      return {
+        tweets,
+        // v2 API doesn't provide cursor-based pagination for search
+        next: undefined,
+      };
+    });
   }
 
   /**
@@ -280,19 +328,20 @@ export class Client {
     maxProfiles: number,
     _cursor?: string,
   ): Promise<QueryProfilesResponse> {
-    // Use the generator and collect results
-    const profiles: Profile[] = [];
-    const generator = searchProfiles(query, maxProfiles, this.requireAuth());
+    return this.withAuthenticatedSession(async () => {
+      const profiles: Profile[] = [];
+      const generator = searchProfiles(query, maxProfiles, this.requireAuth());
 
-    for await (const profile of generator) {
-      profiles.push(profile);
-    }
+      for await (const profile of generator) {
+        profiles.push(profile);
+      }
 
-    return {
-      profiles,
-      // v2 API doesn't provide cursor-based pagination for search
-      next: undefined,
-    };
+      return {
+        profiles,
+        // v2 API doesn't provide cursor-based pagination for search
+        next: undefined,
+      };
+    });
   }
 
   /**
@@ -307,7 +356,9 @@ export class Client {
     maxTweets: number,
     cursor?: string,
   ): Promise<QueryTweetsResponse> {
-    return fetchListTweets(listId, maxTweets, cursor, this.requireAuth());
+    return this.withAuthenticatedSession(() =>
+      fetchListTweets(listId, maxTweets, cursor, this.requireAuth()),
+    );
   }
 
   /**
@@ -320,7 +371,9 @@ export class Client {
     userId: string,
     maxProfiles: number,
   ): AsyncGenerator<Profile, void> {
-    return getFollowing(userId, maxProfiles, this.requireAuth());
+    return this.authenticatedGenerator((auth) =>
+      getFollowing(userId, maxProfiles, auth),
+    );
   }
 
   /**
@@ -333,7 +386,9 @@ export class Client {
     userId: string,
     maxProfiles: number,
   ): AsyncGenerator<Profile, void> {
-    return getFollowers(userId, maxProfiles, this.requireAuth());
+    return this.authenticatedGenerator((auth) =>
+      getFollowers(userId, maxProfiles, auth),
+    );
   }
 
   /**
@@ -348,11 +403,8 @@ export class Client {
     maxProfiles: number,
     cursor?: string,
   ): Promise<QueryProfilesResponse> {
-    return fetchProfileFollowing(
-      userId,
-      maxProfiles,
-      this.requireAuth(),
-      cursor,
+    return this.withAuthenticatedSession(() =>
+      fetchProfileFollowing(userId, maxProfiles, this.requireAuth(), cursor),
     );
   }
 
@@ -368,11 +420,8 @@ export class Client {
     maxProfiles: number,
     cursor?: string,
   ): Promise<QueryProfilesResponse> {
-    return fetchProfileFollowers(
-      userId,
-      maxProfiles,
-      this.requireAuth(),
-      cursor,
+    return this.withAuthenticatedSession(() =>
+      fetchProfileFollowers(userId, maxProfiles, this.requireAuth(), cursor),
     );
   }
 
@@ -387,37 +436,39 @@ export class Client {
     count: number,
     _seenTweetIds: string[],
   ): Promise<Tweet[]> {
-    const client = await this.requireAuth().getV2Client();
+    return this.withAuthenticatedSession(async () => {
+      const client = await this.requireAuth().getV2Client();
 
-    const timeline = await client.v2.homeTimeline({
-      max_results: Math.min(count, 100),
-      "tweet.fields": [
-        "id",
-        "text",
-        "created_at",
-        "author_id",
-        "referenced_tweets",
-        "entities",
-        "public_metrics",
-        "attachments",
-        "conversation_id",
-      ],
-      "user.fields": ["id", "name", "username", "profile_image_url"],
-      "media.fields": ["url", "preview_image_url", "type"],
-      expansions: [
-        "author_id",
-        "attachments.media_keys",
-        "referenced_tweets.id",
-      ],
+      const timeline = await client.v2.homeTimeline({
+        max_results: Math.min(count, 100),
+        "tweet.fields": [
+          "id",
+          "text",
+          "created_at",
+          "author_id",
+          "referenced_tweets",
+          "entities",
+          "public_metrics",
+          "attachments",
+          "conversation_id",
+        ],
+        "user.fields": ["id", "name", "username", "profile_image_url"],
+        "media.fields": ["url", "preview_image_url", "type"],
+        expansions: [
+          "author_id",
+          "attachments.media_keys",
+          "referenced_tweets.id",
+        ],
+      });
+
+      const tweets: Tweet[] = [];
+      for await (const tweet of timeline) {
+        tweets.push(parseTweetV2ToV1(tweet, timeline.includes));
+        if (tweets.length >= count) break;
+      }
+
+      return tweets;
     });
-
-    const tweets: Tweet[] = [];
-    for await (const tweet of timeline) {
-      tweets.push(parseTweetV2ToV1(tweet, timeline.includes));
-      if (tweets.length >= count) break;
-    }
-
-    return tweets;
   }
 
   /**
@@ -441,71 +492,68 @@ export class Client {
     maxTweets = 200,
     cursor?: string,
   ): Promise<{ tweets: Tweet[]; next?: string }> {
-    const client = await this.requireAuth().getV2Client();
+    return this.withAuthenticatedSession(async () => {
+      const client = await this.requireAuth().getV2Client();
 
-    const response = await client.v2.userTimeline(userId, {
-      max_results: Math.min(maxTweets, 100),
-      "tweet.fields": [
-        "id",
-        "text",
-        "created_at",
-        "author_id",
-        "referenced_tweets",
-        "entities",
-        "public_metrics",
-        "attachments",
-        "conversation_id",
-      ],
-      "user.fields": ["id", "name", "username", "profile_image_url"],
-      "media.fields": ["url", "preview_image_url", "type"],
-      expansions: [
-        "author_id",
-        "attachments.media_keys",
-        "referenced_tweets.id",
-      ],
-      pagination_token: cursor,
+      const response = await client.v2.userTimeline(userId, {
+        max_results: Math.min(maxTweets, 100),
+        "tweet.fields": [
+          "id",
+          "text",
+          "created_at",
+          "author_id",
+          "referenced_tweets",
+          "entities",
+          "public_metrics",
+          "attachments",
+          "conversation_id",
+        ],
+        "user.fields": ["id", "name", "username", "profile_image_url"],
+        "media.fields": ["url", "preview_image_url", "type"],
+        expansions: [
+          "author_id",
+          "attachments.media_keys",
+          "referenced_tweets.id",
+        ],
+        pagination_token: cursor,
+      });
+
+      const tweets: Tweet[] = [];
+      for await (const tweet of response) {
+        tweets.push(parseTweetV2ToV1(tweet, response.includes));
+        if (tweets.length >= maxTweets) break;
+      }
+
+      return {
+        tweets,
+        next: response.meta?.next_token,
+      };
     });
-
-    const tweets: Tweet[] = [];
-    for await (const tweet of response) {
-      tweets.push(parseTweetV2ToV1(tweet, response.includes));
-      if (tweets.length >= maxTweets) break;
-    }
-
-    return {
-      tweets,
-      next: response.meta?.next_token,
-    };
   }
 
   async *getUserTweetsIterator(
     userId: string,
     maxTweets = 200,
   ): AsyncGenerator<Tweet, void> {
-    let cursor: string | undefined;
-    let retrievedTweets = 0;
+    const tweets = await this.withAuthenticatedSession(async () => {
+      const collected: Tweet[] = [];
+      let cursor: string | undefined;
 
-    while (retrievedTweets < maxTweets) {
-      const response = await this.getUserTweets(
-        userId,
-        maxTweets - retrievedTweets,
-        cursor,
-      );
-
-      for (const tweet of response.tweets) {
-        yield tweet;
-        retrievedTweets++;
-        if (retrievedTweets >= maxTweets) {
-          break;
-        }
+      while (collected.length < maxTweets) {
+        const response = await this.getUserTweets(
+          userId,
+          maxTweets - collected.length,
+          cursor,
+        );
+        collected.push(
+          ...response.tweets.slice(0, maxTweets - collected.length),
+        );
+        cursor = response.next;
+        if (!cursor) break;
       }
-
-      cursor = response.next;
-
-      if (!cursor) {
-        break;
-      }
-    }
+      return collected;
+    });
+    yield* tweets;
   }
 
   /**
@@ -526,7 +574,9 @@ export class Client {
    * @returns An {@link AsyncGenerator} of tweets from the provided user.
    */
   public getTweets(user: string, maxTweets = 200): AsyncGenerator<Tweet> {
-    return getTweets(user, maxTweets, this.requireAuth());
+    return this.authenticatedGenerator((auth) =>
+      getTweets(user, maxTweets, auth),
+    );
   }
 
   /**
@@ -539,7 +589,9 @@ export class Client {
     userId: string,
     maxTweets = 200,
   ): AsyncGenerator<Tweet, void> {
-    return getTweetsByUserId(userId, maxTweets, this.requireAuth());
+    return this.authenticatedGenerator((auth) =>
+      getTweetsByUserId(userId, maxTweets, auth),
+    );
   }
 
   /**
@@ -560,8 +612,10 @@ export class Client {
     mediaData: Buffer,
     options: { mimeType: string },
   ): Promise<string> {
-    const twitterApiClient = await this.requireAuth().getV2Client();
-    return await twitterApiClient.v1.uploadMedia(mediaData, options);
+    return this.withAuthenticatedSession(async () => {
+      const twitterApiClient = await this.requireAuth().getV2Client();
+      return await twitterApiClient.v1.uploadMedia(mediaData, options);
+    });
   }
 
   async sendTweet(
@@ -577,13 +631,15 @@ export class Client {
     if (text.toLowerCase().startsWith("error:")) {
       throw new Error(`Error sending tweet: ${text}`);
     }
-    return await createCreateTweetRequest(
-      text,
-      this.requireAuth(),
-      replyToTweetId,
-      mediaData,
-      hideLinkPreview,
-      mediaIds,
+    return this.withAuthenticatedSession(() =>
+      createCreateTweetRequest(
+        text,
+        this.requireAuth(),
+        replyToTweetId,
+        mediaData,
+        hideLinkPreview,
+        mediaIds,
+      ),
     );
   }
 
@@ -598,11 +654,13 @@ export class Client {
     if (text.toLowerCase().startsWith("error:")) {
       throw new Error(`Error sending note tweet: ${text}`);
     }
-    return await createCreateNoteTweetRequest(
-      text,
-      this.requireAuth(),
-      replyToTweetId,
-      mediaData,
+    return this.withAuthenticatedSession(() =>
+      createCreateNoteTweetRequest(
+        text,
+        this.requireAuth(),
+        replyToTweetId,
+        mediaData,
+      ),
     );
   }
 
@@ -618,11 +676,13 @@ export class Client {
     replyToTweetId?: string,
     mediaData?: { data: Buffer; mediaType: string }[],
   ) {
-    return await createCreateLongTweetRequest(
-      text,
-      this.requireAuth(),
-      replyToTweetId,
-      mediaData,
+    return this.withAuthenticatedSession(() =>
+      createCreateLongTweetRequest(
+        text,
+        this.requireAuth(),
+        replyToTweetId,
+        mediaData,
+      ),
     );
   }
 
@@ -641,11 +701,13 @@ export class Client {
       poll?: PollData;
     },
   ) {
-    return await createCreateTweetRequestV2(
-      text,
-      this.requireAuth(),
-      replyToTweetId,
-      options,
+    return this.withAuthenticatedSession(() =>
+      createCreateTweetRequestV2(
+        text,
+        this.requireAuth(),
+        replyToTweetId,
+        options,
+      ),
     );
   }
 
@@ -659,7 +721,9 @@ export class Client {
     user: string,
     maxTweets = 200,
   ): AsyncGenerator<Tweet> {
-    return getTweetsAndReplies(user, maxTweets, this.requireAuth());
+    return this.authenticatedGenerator((auth) =>
+      getTweetsAndReplies(user, maxTweets, auth),
+    );
   }
 
   /**
@@ -672,7 +736,9 @@ export class Client {
     userId: string,
     maxTweets = 200,
   ): AsyncGenerator<Tweet, void> {
-    return getTweetsAndRepliesByUserId(userId, maxTweets, this.requireAuth());
+    return this.authenticatedGenerator((auth) =>
+      getTweetsAndRepliesByUserId(userId, maxTweets, auth),
+    );
   }
 
   /**
@@ -732,7 +798,9 @@ export class Client {
     includeRetweets = false,
     max = 200,
   ): Promise<Tweet | null | undefined> {
-    return getLatestTweet(user, includeRetweets, max, this.requireAuth());
+    return this.withAuthenticatedSession(() =>
+      getLatestTweet(user, includeRetweets, max, this.requireAuth()),
+    );
   }
 
   /**
@@ -741,7 +809,9 @@ export class Client {
    * @returns The {@link Tweet} object, or `null` if it couldn't be fetched.
    */
   public getTweet(id: string): Promise<Tweet | null> {
-    return getTweet(id, this.requireAuth());
+    return this.withAuthenticatedSession(() =>
+      getTweet(id, this.requireAuth()),
+    );
   }
 
   /**
@@ -769,7 +839,9 @@ export class Client {
       placeFields?: TTweetv2PlaceField[];
     } = defaultOptions,
   ): Promise<Tweet | null> {
-    return await getTweetV2(id, this.requireAuth(), options);
+    return this.withAuthenticatedSession(() =>
+      getTweetV2(id, this.requireAuth(), options),
+    );
   }
 
   /**
@@ -797,7 +869,9 @@ export class Client {
       placeFields?: TTweetv2PlaceField[];
     } = defaultOptions,
   ): Promise<Tweet[]> {
-    return await getTweetsV2(ids, this.requireAuth(), options);
+    return this.withAuthenticatedSession(() =>
+      getTweetsV2(ids, this.requireAuth(), options),
+    );
   }
 
   /**
@@ -806,18 +880,38 @@ export class Client {
    */
   public updateAuth(auth: TwitterAuth) {
     if (this.auth === auth) return;
-    this.auth?.invalidate();
+    if (this.authContext.getStore()?.active) {
+      throw new ElizaError(
+        "Cannot replace X credentials inside an authenticated operation",
+        { code: "X_AUTH_REPLACEMENT_DURING_SESSION" },
+      );
+    }
+    const priorLogout = this.auth?.logout() ?? Promise.resolve();
+    auth.deferUntil(priorLogout);
     this.auth = auth;
   }
 
   public async authenticate(provider: TwitterAuthProvider): Promise<void> {
-    this.auth?.invalidate();
-    this.auth = new TwitterAuth(provider);
+    const auth = new TwitterAuth(provider);
+    this.updateAuth(auth);
+    try {
+      await auth.getAuthenticatedSession();
+    } catch (error) {
+      // error-policy:J1 failed public authentication leaves no unusable auth
+      // installed and preserves the sanitized connector error for the caller.
+      if (this.auth === auth) {
+        this.auth = undefined;
+      }
+      await auth.logout();
+      throw error;
+    }
   }
 
   /**
    * Get current authentication credentials
    * @returns {TwitterAuth | null} Current authentication or null if not authenticated
+   * @deprecated Use {@link isAuthenticated} for state or
+   * {@link withAuthenticatedSession} for credential-bound work.
    */
   public getAuth(): TwitterAuth | null {
     return this.auth ?? null;
@@ -887,12 +981,17 @@ export class Client {
         accessSecret: resolvedAccessSecret,
       }),
     };
-    this.auth?.invalidate();
-    this.auth = new TwitterAuth(provider);
+    this.updateAuth(new TwitterAuth(provider));
   }
 
   /** Invalidates the local authenticated client and all derived identity. */
   public async logout(): Promise<void> {
+    if (this.authContext.getStore()?.active) {
+      throw new ElizaError(
+        "Cannot log out X credentials inside an authenticated operation",
+        { code: "X_AUTH_REPLACEMENT_DURING_SESSION" },
+      );
+    }
     const auth = this.auth;
     this.auth = undefined;
     await auth?.logout();
@@ -912,11 +1011,13 @@ export class Client {
       mediaData: { data: Buffer; mediaType: string }[];
     },
   ) {
-    return await createQuoteTweetRequest(
-      text,
-      quotedTweetId,
-      this.requireAuth(),
-      options?.mediaData,
+    return this.withAuthenticatedSession(() =>
+      createQuoteTweetRequest(
+        text,
+        quotedTweetId,
+        this.requireAuth(),
+        options?.mediaData,
+      ),
     );
   }
 
@@ -928,7 +1029,9 @@ export class Client {
   public async deleteTweet(
     tweetId: string,
   ): Promise<Awaited<ReturnType<typeof deleteTweet>>> {
-    return await deleteTweet(tweetId, this.requireAuth());
+    return this.withAuthenticatedSession(() =>
+      deleteTweet(tweetId, this.requireAuth()),
+    );
   }
 
   /**
@@ -937,8 +1040,9 @@ export class Client {
    * @returns A promise that resolves when the tweet is liked.
    */
   public async likeTweet(tweetId: string): Promise<void> {
-    // Call the likeTweet function from tweets.ts
-    await likeTweet(tweetId, this.requireAuth());
+    await this.withAuthenticatedSession(() =>
+      likeTweet(tweetId, this.requireAuth()),
+    );
   }
 
   /**
@@ -947,7 +1051,9 @@ export class Client {
    * @returns A promise that resolves when the tweet is unliked.
    */
   public async unlikeTweet(tweetId: string): Promise<void> {
-    await unlikeTweet(tweetId, this.requireAuth());
+    await this.withAuthenticatedSession(() =>
+      unlikeTweet(tweetId, this.requireAuth()),
+    );
   }
 
   /**
@@ -956,8 +1062,9 @@ export class Client {
    * @returns A promise that resolves when the tweet is retweeted.
    */
   public async retweet(tweetId: string): Promise<void> {
-    // Call the retweet function from tweets.ts
-    await retweet(tweetId, this.requireAuth());
+    await this.withAuthenticatedSession(() =>
+      retweet(tweetId, this.requireAuth()),
+    );
   }
 
   /**
@@ -966,7 +1073,9 @@ export class Client {
    * @returns A promise that resolves when the tweet is unretweeted.
    */
   public async unretweet(tweetId: string): Promise<void> {
-    await unretweet(tweetId, this.requireAuth());
+    await this.withAuthenticatedSession(() =>
+      unretweet(tweetId, this.requireAuth()),
+    );
   }
 
   /**
@@ -975,8 +1084,9 @@ export class Client {
    * @returns A promise that resolves when the user is followed.
    */
   public async followUser(userName: string): Promise<void> {
-    // Call the followUser function from relationships.ts
-    await followUser(userName, this.requireAuth());
+    await this.withAuthenticatedSession(() =>
+      followUser(userName, this.requireAuth()),
+    );
   }
 
   /**
@@ -987,26 +1097,29 @@ export class Client {
    * @returns Array of DM conversations
    */
   public async getDirectMessageConversations(userId: string, cursor?: string) {
-    const client = await this.requireAuth().getV2Client();
-    const options: NonNullable<Parameters<typeof client.v2.listDmEvents>[0]> = {
-      "dm_event.fields": [
-        "id",
-        "text",
-        "event_type",
-        "created_at",
-        "sender_id",
-        "dm_conversation_id",
-        "participant_ids",
-      ],
-      event_types: ["MessageCreate"],
-      ...(cursor ? { pagination_token: cursor } : {}),
-    };
+    return this.withAuthenticatedSession(async () => {
+      const client = await this.requireAuth().getV2Client();
+      const options: NonNullable<Parameters<typeof client.v2.listDmEvents>[0]> =
+        {
+          "dm_event.fields": [
+            "id",
+            "text",
+            "event_type",
+            "created_at",
+            "sender_id",
+            "dm_conversation_id",
+            "participant_ids",
+          ],
+          event_types: ["MessageCreate"],
+          ...(cursor ? { pagination_token: cursor } : {}),
+        };
 
-    const timeline = userId
-      ? await client.v2.listDmEventsWithParticipant(userId, options)
-      : await client.v2.listDmEvents(options);
+      const timeline = userId
+        ? await client.v2.listDmEventsWithParticipant(userId, options)
+        : await client.v2.listDmEvents(options);
 
-    return { conversations: timeline.events ?? [] };
+      return { conversations: timeline.events ?? [] };
+    });
   }
 
   /**
@@ -1017,10 +1130,14 @@ export class Client {
    * @returns The response from the Twitter API
    */
   public async sendDirectMessage(conversationId: string, text: string) {
-    const client = await this.requireAuth().getV2Client();
-    const data = await client.v2.sendDmInConversation(conversationId, { text });
+    return this.withAuthenticatedSession(async () => {
+      const client = await this.requireAuth().getV2Client();
+      const data = await client.v2.sendDmInConversation(conversationId, {
+        text,
+      });
 
-    return { id: data.dm_event_id, data };
+      return { id: normalizeXReceiptId(data.dm_event_id), data };
+    });
   }
 
   private handleResponse<T>(res: RequestApiResult<T>): T {
@@ -1037,7 +1154,9 @@ export class Client {
    * @returns An array of users (retweeters).
    */
   public async getRetweetersOfTweet(tweetId: string): Promise<Retweeter[]> {
-    return await getAllRetweeters(tweetId, this.requireAuth());
+    return this.withAuthenticatedSession(() =>
+      getAllRetweeters(tweetId, this.requireAuth()),
+    );
   }
 
   /**
@@ -1050,31 +1169,35 @@ export class Client {
     tweetId: string,
     maxQuotes: number = 100,
   ): Promise<Tweet[]> {
-    const allQuotes: Tweet[] = [];
+    return this.withAuthenticatedSession(async () => {
+      const allQuotes: Tweet[] = [];
+      let cursor: string | undefined;
+      let totalFetched = 0;
 
-    let cursor: string | undefined;
-    let totalFetched = 0;
+      while (totalFetched < maxQuotes) {
+        const batchSize = Math.min(40, maxQuotes - totalFetched);
+        const page = await this.fetchQuotedTweetsPage(
+          tweetId,
+          batchSize,
+          cursor,
+        );
 
-    while (totalFetched < maxQuotes) {
-      const batchSize = Math.min(40, maxQuotes - totalFetched);
-      const page = await this.fetchQuotedTweetsPage(tweetId, batchSize, cursor);
+        if (page.tweets.length === 0) {
+          break;
+        }
 
-      if (page.tweets.length === 0) {
-        break;
+        allQuotes.push(...page.tweets);
+        totalFetched += page.tweets.length;
+
+        if (!page.next) {
+          break;
+        }
+
+        cursor = page.next;
       }
 
-      allQuotes.push(...page.tweets);
-      totalFetched += page.tweets.length;
-
-      // Check if there's a next page
-      if (!page.next) {
-        break;
-      }
-
-      cursor = page.next;
-    }
-
-    return allQuotes.slice(0, maxQuotes);
+      return allQuotes.slice(0, maxQuotes);
+    });
   }
 
   /**
@@ -1090,23 +1213,25 @@ export class Client {
     maxQuotes: number = 40,
     _cursor?: string,
   ): Promise<QueryTweetsResponse> {
-    const quotes: Tweet[] = [];
-    let count = 0;
+    return this.withAuthenticatedSession(async () => {
+      const quotes: Tweet[] = [];
+      let count = 0;
 
-    // searchQuotedTweets doesn't support cursor, so we'll collect all quotes up to maxQuotes
-    for await (const quote of searchQuotedTweets(
-      tweetId,
-      maxQuotes,
-      this.requireAuth(),
-    )) {
-      quotes.push(quote);
-      count++;
-      if (count >= maxQuotes) break;
-    }
+      for await (const quote of searchQuotedTweets(
+        tweetId,
+        maxQuotes,
+        this.requireAuth(),
+      )) {
+        quotes.push(quote);
+        count++;
+        if (count >= maxQuotes) break;
+      }
 
-    return {
-      tweets: quotes,
-      next: undefined, // Twitter API v2 doesn't provide cursor for quote search
-    };
+      return {
+        tweets: quotes,
+        // Twitter API v2 doesn't provide a cursor for quote search.
+        next: undefined,
+      };
+    });
   }
 }

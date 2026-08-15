@@ -6,6 +6,7 @@
 import { createUniqueUuid, ElizaError, logger, type UUID } from "@elizaos/core";
 import type { ClientBase, TwitterProfile } from "../base";
 import { SearchMode } from "../client";
+import { extractXWriteReceiptId } from "../utils/provider-receipt";
 import { getEpochMs } from "../utils/time";
 import type {
   CreatePostOptions,
@@ -21,84 +22,12 @@ export class TwitterPostService implements IPostService {
     return error instanceof Error ? error.message : String(error);
   }
 
-  private async safeParseJsonResponse(
-    result: unknown,
-  ): Promise<unknown | undefined> {
-    try {
-      const asRecord = (v: unknown): Record<string, unknown> =>
-        typeof v === "object" && v !== null
-          ? (v as Record<string, unknown>)
-          : {};
-      const recordResult = asRecord(result);
-
-      if (typeof recordResult.clone === "function") {
-        // If body is already used, clone() may throw; guard defensively.
-        if (recordResult.bodyUsed === true) return undefined;
-        const cloned = (recordResult.clone as () => unknown)();
-        const clonedRecord = asRecord(cloned);
-        if (typeof clonedRecord.json === "function") {
-          return await (clonedRecord.json as () => Promise<unknown>)();
-        }
-        return undefined;
-      }
-
-      // Non-Response shapes (e.g. our internal wrappers) may expose json()
-      // but do not consume streams.
-      if (typeof recordResult.json === "function") {
-        return await (recordResult.json as () => Promise<unknown>)();
-      }
-      return undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private extractRestId(result: unknown): string | undefined {
-    const r = result as {
-      rest_id?: unknown;
-      data?: {
-        create_tweet?: { tweet_results?: { result?: { rest_id?: unknown } } };
-        data?: {
-          create_tweet?: { tweet_results?: { result?: { rest_id?: unknown } } };
-        };
-      };
-    } | null;
-    const candidate =
-      r?.rest_id ??
-      r?.data?.create_tweet?.tweet_results?.result?.rest_id ??
-      r?.data?.data?.create_tweet?.tweet_results?.result?.rest_id;
-    return typeof candidate === "string" ? candidate : undefined;
-  }
-
-  private async extractTweetId(result: unknown): Promise<string | undefined> {
-    const r = result as {
-      id?: unknown;
-      data?: { id?: unknown; data?: { id?: unknown } };
-      json?: unknown;
-    } | null;
-    const direct = r?.id ?? r?.data?.id ?? r?.data?.data?.id;
-    if (typeof direct === "string") return direct;
-    const restId = this.extractRestId(result);
-    if (restId) return restId;
-
-    if (r && typeof r.json === "function") {
-      const body = (await this.safeParseJsonResponse(result)) as {
-        id?: unknown;
-        data?: { id?: unknown; data?: { id?: unknown } };
-      } | null;
-      const viaBody = body?.id ?? body?.data?.id ?? body?.data?.data?.id;
-      if (typeof viaBody === "string") return viaBody;
-      return this.extractRestId(body);
-    }
-
-    return undefined;
-  }
-
   async createPost(
     options: CreatePostOptions,
     authenticatedProfile?: TwitterProfile,
   ): Promise<Post> {
-    return this.client.withAuthenticatedSession(async ({ profile }) => {
+    return this.client.withAuthenticatedSession(async (session) => {
+      const { profile } = session;
       if (authenticatedProfile && authenticatedProfile.id !== profile.id) {
         throw new ElizaError(
           "Authenticated X profile changed before the post was admitted",
@@ -125,8 +54,13 @@ export class TwitterPostService implements IPostService {
               mediaIds.push(mediaId);
               logger.info(`Media uploaded successfully. Media ID: ${mediaId}`);
             } catch (error) {
-              logger.error("Error uploading media:", this.errorDetail(error));
-              // Continue with other media files even if one fails
+              // error-policy:J2 Publishing without every requested attachment
+              // would silently change an irreversible external effect.
+              throw new ElizaError("X media upload failed", {
+                code: "X_MEDIA_UPLOAD_FAILED",
+                cause: error,
+                context: { mimeType: media.type },
+              });
             }
           }
 
@@ -135,6 +69,11 @@ export class TwitterPostService implements IPostService {
           );
         }
 
+        if (!this.client.isAuthenticatedSessionCurrent(session)) {
+          throw new ElizaError("X credentials rotated before post egress", {
+            code: "X_AUTH_SESSION_ROTATED",
+          });
+        }
         const result =
           mediaIds.length > 0
             ? await this.client.twitterClient.sendTweet(
@@ -152,22 +91,21 @@ export class TwitterPostService implements IPostService {
                 options.inReplyTo,
               );
 
-        const tweetId = await this.extractTweetId(result);
+        const tweetId = await extractXWriteReceiptId(result);
         if (!tweetId) {
-          const safeResult =
-            typeof result === "string"
-              ? result
-              : JSON.stringify(result, null, 2).slice(0, 8000);
           logger.error(
-            `Twitter createPost: could not extract tweet id from API result ${JSON.stringify(
-              {
-                inReplyTo: options.inReplyTo,
-                textLength: options.text?.length,
-              },
-            )} ${safeResult}`,
+            `Twitter createPost: provider accepted the request without a usable receipt (reply=${options.inReplyTo ? "yes" : "no"}, textLength=${options.text.length})`,
           );
-          throw new Error(
-            "Twitter createPost failed: could not extract tweet id from API response. See logs for raw response.",
+          throw new ElizaError(
+            "X accepted the post but returned no usable receipt; do not retry blindly",
+            {
+              code: "X_POST_RECEIPT_INDETERMINATE",
+              context: {
+                accountId: this.client.accountId,
+                providerAccepted: true,
+                retrySafe: false,
+              },
+            },
           );
         }
 
@@ -254,10 +192,10 @@ export class TwitterPostService implements IPostService {
 
       return post;
     } catch (error) {
-      // error-policy:J7 a post-fetch failure must surface to the agent rather than
-      // reading as "no such post"; degrade to null after reporting.
+      // error-policy:J7 Report the connector failure to the agent, then keep it
+      // distinct from the legitimate null returned for a missing post.
       this.client.runtime.reportError("XPostService.getPost", error);
-      return null;
+      throw error;
     }
   }
 
@@ -325,10 +263,10 @@ export class TwitterPostService implements IPostService {
 
       return posts;
     } catch (error) {
-      // error-policy:J7 a posts-fetch failure must surface to the agent rather than
-      // reading as an empty timeline; degrade to no posts after reporting.
+      // error-policy:J7 Report the connector failure to the agent, then keep it
+      // distinct from a legitimately empty timeline.
       this.client.runtime.reportError("XPostService.getPosts", error);
-      return [];
+      throw error;
     }
   }
 
@@ -407,10 +345,10 @@ export class TwitterPostService implements IPostService {
         return posts;
       });
     } catch (error) {
-      // error-policy:J7 a mentions-fetch failure must surface to the agent rather
-      // than reading as no mentions; degrade to an empty list after reporting.
+      // error-policy:J7 Report the connector failure to the agent, then keep it
+      // distinct from a legitimately empty mention list.
       this.client.runtime.reportError("XPostService.getMentions", error);
-      return [];
+      throw error;
     }
   }
 

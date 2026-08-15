@@ -28,7 +28,11 @@ import {
   type TargetInfo,
   type UUID,
 } from "@elizaos/core";
-import { ClientBase, type TwitterProfile } from "../base";
+import {
+  ClientBase,
+  type TwitterAccountSession,
+  type TwitterProfile,
+} from "../base";
 import {
   normalizeXAccountId,
   resolveDefaultXAccountId,
@@ -44,6 +48,7 @@ import { TwitterInteractionClient } from "../interactions";
 import { TwitterPostClient } from "../post";
 import { TwitterTimelineClient } from "../timeline";
 import type { ITwitterClient, TwitterClientState } from "../types";
+import { normalizeXReceiptId } from "../utils/provider-receipt";
 import { getSetting } from "../utils/settings";
 import { getEpochMs } from "../utils/time";
 import { TwitterPostService } from "./PostService";
@@ -58,6 +63,19 @@ const X_CONNECTOR_CAPABILITIES = [
 
 const X_USER_ID_PATTERN = /^\d+$/;
 const X_MAX_POST_LENGTH = 280;
+
+function isXUserNotFound(error: unknown): boolean {
+  if (error instanceof ElizaError && error.code === "X_PROFILE_NOT_FOUND") {
+    return true;
+  }
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as {
+    code?: unknown;
+    status?: unknown;
+    statusCode?: unknown;
+  };
+  return [candidate.code, candidate.status, candidate.statusCode].includes(404);
+}
 
 export type XAccountCapability =
   | "x.read"
@@ -235,14 +253,18 @@ export class TwitterClientInstance implements ITwitterClient {
   directMessages?: TwitterDirectMessageClient;
   readonly accountId: string;
 
-  constructor(runtime: IAgentRuntime, state: TwitterClientState) {
+  constructor(
+    runtime: IAgentRuntime,
+    state: TwitterClientState,
+    options: { publishLegacyIdentity?: boolean } = {},
+  ) {
     this.accountId = resolveRequestedXAccountId(
       runtime,
       state,
       state.accountId,
     );
     // Pass twitterConfig to the base client
-    this.client = new ClientBase(runtime, state);
+    this.client = new ClientBase(runtime, state, options);
 
     // Posting logic
     const postEnabled = parseBooleanFromText(
@@ -420,7 +442,9 @@ export class XService extends Service {
 
     const startPromise = (async () => {
       await validateTwitterConfig(runtime, state);
-      const instance = new TwitterClientInstance(runtime, state);
+      const instance = new TwitterClientInstance(runtime, state, {
+        publishLegacyIdentity: accountId === this.defaultAccountId,
+      });
       await instance.client.init();
 
       if (options.startAutonomousClients) {
@@ -712,33 +736,32 @@ export class XService extends Service {
         ? (metadata as Record<string, unknown>)
         : undefined;
     const accountId = this.resolveAccountId(target.accountId);
-    const client = await this.getTwitterClientForAccount(accountId);
-    const recipient = await this.resolveDmRecipient(
-      (typeof metadataRecord?.xUserId === "string"
-        ? metadataRecord.xUserId
-        : undefined) ??
-        (typeof metadataRecord?.twitterUserId === "string"
-          ? metadataRecord.twitterUserId
+    await this.withDmSession(accountId, async (base, session) => {
+      const recipient = await this.resolveDmRecipient(
+        (typeof metadataRecord?.xUserId === "string"
+          ? metadataRecord.xUserId
           : undefined) ??
-        (typeof metadataRecord?.xUsername === "string"
-          ? metadataRecord.xUsername
-          : undefined) ??
-        (typeof metadataRecord?.twitterUsername === "string"
-          ? metadataRecord.twitterUsername
-          : undefined) ??
-        (typeof target.entityId === "string" ? target.entityId : undefined) ??
-        target.channelId ??
-        target.threadId,
-      client.client,
-    );
-
-    if (!recipient) {
-      throw new Error(
-        "X DM connector requires a resolvable recipient user id.",
+          (typeof metadataRecord?.twitterUserId === "string"
+            ? metadataRecord.twitterUserId
+            : undefined) ??
+          (typeof metadataRecord?.xUsername === "string"
+            ? metadataRecord.xUsername
+            : undefined) ??
+          (typeof metadataRecord?.twitterUsername === "string"
+            ? metadataRecord.twitterUsername
+            : undefined) ??
+          (typeof target.entityId === "string" ? target.entityId : undefined) ??
+          target.channelId ??
+          target.threadId,
+        base,
       );
-    }
-
-    await this.sendXDirectMessage(accountId, recipient, text);
+      if (!recipient) {
+        throw new Error(
+          "X DM connector requires a resolvable recipient user id.",
+        );
+      }
+      await this.sendXDirectMessage(base, session, recipient, text);
+    });
   }
 
   async sendDirectMessageForAccount(
@@ -750,18 +773,18 @@ export class XService extends Service {
       throw new Error("X DM connector requires non-empty text content.");
     }
 
-    const client = await this.getTwitterClientForAccount(accountId);
-    const recipient = await this.resolveDmRecipient(
-      params.participantId,
-      client.client,
-    );
-    if (!recipient) {
-      throw new Error(
-        "X DM connector requires a resolvable recipient user id.",
+    const sent = await this.withDmSession(accountId, async (base, session) => {
+      const recipient = await this.resolveDmRecipient(
+        params.participantId,
+        base,
       );
-    }
-
-    const sent = await this.sendXDirectMessage(accountId, recipient, text);
+      if (!recipient) {
+        throw new Error(
+          "X DM connector requires a resolvable recipient user id.",
+        );
+      }
+      return this.sendXDirectMessage(base, session, recipient, text);
+    });
     return {
       ok: true,
       status: 201,
@@ -819,7 +842,6 @@ export class XService extends Service {
       context?.accountId,
       context?.target,
       context?.metadata,
-      content,
     );
     const base = (await this.getTwitterClientForAccount(accountId)).client;
     return base.withAuthenticatedSession(async ({ profile }) => {
@@ -853,6 +875,7 @@ export class XService extends Service {
         metadata: post.metadata,
         metrics: post.metrics,
         accountId,
+        ownUserId: profile.id,
       });
     });
   }
@@ -935,25 +958,16 @@ export class XService extends Service {
     accountId: string,
     params: { conversationId: string; text: string },
   ): Promise<{ ok: true; status: number; messageId: string | null }> {
-    const client = await this.getV2DmClient(accountId);
-    const sender = client.v2 as typeof client.v2 & {
-      sendDmToConversation?: (
-        conversationId: string,
-        body: { text: string },
-      ) => Promise<{ data?: { dm_event_id?: string } }>;
-    };
-    if (typeof sender.sendDmToConversation !== "function") {
-      throw new Error(
-        "X v2 client does not expose sendDmToConversation; conversation DM send requires plugin-x DM conversation support.",
-      );
-    }
-    const result = await sender.sendDmToConversation(params.conversationId, {
-      text: params.text,
+    const result = await this.withDmSession(accountId, (base, session) => {
+      this.assertDmSessionCurrent(base, session);
+      return session.client.v2.sendDmInConversation(params.conversationId, {
+        text: params.text,
+      });
     });
     return {
       ok: true,
       status: 201,
-      messageId: result.data?.dm_event_id ?? null,
+      messageId: normalizeXReceiptId(result.dm_event_id) ?? null,
     };
   }
 
@@ -999,33 +1013,40 @@ export class XService extends Service {
         ? context.target.entityId
         : undefined);
 
-    const posts =
-      params.feed === "mentions"
-        ? await postService.getMentions(runtime.agentId, {
-            limit,
-            before: params.cursor,
-          })
-        : await postService.getPosts({
-            agentId: runtime.agentId,
-            ...(targetUserId ? { userId: targetUserId } : {}),
-            limit,
-            before: params.cursor,
-          });
+    return base.withAuthenticatedSession(async ({ profile }) => {
+      const posts =
+        params.feed === "mentions"
+          ? await postService.getMentions(runtime.agentId, {
+              limit,
+              before: params.cursor,
+            })
+          : await postService.getPosts({
+              agentId: runtime.agentId,
+              ...(targetUserId ? { userId: targetUserId } : {}),
+              limit,
+              before: params.cursor,
+            });
 
-    return posts.map((post) =>
-      this.buildXPostMemory(runtime, {
-        id: post.id,
-        userId: post.userId,
-        username: post.username,
-        text: post.text,
-        createdAt: post.timestamp,
-        inReplyTo: post.inReplyTo,
-        roomId: post.roomId,
-        metadata: post.metadata,
-        metrics: post.metrics,
-        accountId,
-      }),
-    );
+      return posts.map((post) =>
+        this.buildXPostMemory(runtime, {
+          id: post.id,
+          userId: post.userId,
+          username: post.username,
+          text: post.text,
+          createdAt: post.timestamp,
+          inReplyTo: post.inReplyTo,
+          roomId: post.roomId,
+          metadata: post.metadata,
+          metrics: post.metrics,
+          accountId,
+          ownUserId: profile.id,
+          conversationId:
+            typeof post.metadata?.conversationId === "string"
+              ? post.metadata.conversationId
+              : post.id,
+        }),
+      );
+    });
   }
 
   async searchConnectorPosts(
@@ -1044,40 +1065,44 @@ export class XService extends Service {
       context.metadata,
     );
     const base = (await this.getTwitterClientForAccount(accountId)).client;
-    const result = await base.fetchSearchTweets(
-      query,
-      clampLimit(params.limit, 20, 100),
-      SearchMode.Latest,
-      params.cursor,
-    );
-    return result.tweets.flatMap((tweet) => {
-      // Normalize once per row: a present-but-unusable timestamp fails the
-      // row closed instead of surfacing a healthy-looking memory with an
-      // undefined or "now" creation time (#18965).
-      const createdAt = getEpochMs(tweet.timestamp);
-      if (createdAt === undefined) {
-        logger.debug(
-          `X searchPosts: skipping tweet ${tweet.id ?? "unknown"} with unusable timestamp`,
-        );
-        return [];
-      }
-      return [
-        this.buildXPostMemory(runtime, {
-          id: tweet.id ?? "unknown",
-          userId: tweet.userId ?? "unknown",
-          username: tweet.username ?? undefined,
-          text: tweet.text ?? "",
-          createdAt,
-          inReplyTo: tweet.inReplyToStatusId,
-          metrics: {
-            likes: tweet.likes,
-            reposts: tweet.retweets,
-            replies: tweet.replies,
-            quotes: tweet.quotes,
-          },
-          accountId,
-        }),
-      ];
+    return base.withAuthenticatedSession(async ({ profile }) => {
+      const result = await base.fetchSearchTweets(
+        query,
+        clampLimit(params.limit, 20, 100),
+        SearchMode.Latest,
+        params.cursor,
+      );
+      return result.tweets.flatMap((tweet) => {
+        // Normalize once per row: a present-but-unusable timestamp fails the
+        // row closed instead of surfacing a healthy-looking memory with an
+        // undefined or "now" creation time (#18965).
+        const createdAt = getEpochMs(tweet.timestamp);
+        if (createdAt === undefined) {
+          logger.debug(
+            `X searchPosts: skipping tweet ${tweet.id ?? "unknown"} with unusable timestamp`,
+          );
+          return [];
+        }
+        return [
+          this.buildXPostMemory(runtime, {
+            id: tweet.id ?? "unknown",
+            userId: tweet.userId ?? "unknown",
+            username: tweet.username ?? undefined,
+            text: tweet.text ?? "",
+            createdAt,
+            inReplyTo: tweet.inReplyToStatusId,
+            conversationId: tweet.conversationId ?? tweet.id,
+            metrics: {
+              likes: tweet.likes,
+              reposts: tweet.retweets,
+              replies: tweet.replies,
+              quotes: tweet.quotes,
+            },
+            accountId,
+            ownUserId: profile.id,
+          }),
+        ];
+      });
     });
   }
 
@@ -1101,17 +1126,22 @@ export class XService extends Service {
       accountId,
       clampLimit(params.limit, 25, 50),
     ).catch((error) => {
-      // error-policy:J7 a DM fetch failure (expired token, rate limit) must
-      // surface to the agent rather than reading as an empty inbox; degrade to
-      // no messages after reporting.
+      // error-policy:J7 Report the connector failure to the agent, then keep it
+      // distinct from a legitimately empty inbox for the calling boundary.
       runtime.reportError("XService.fetchConnectorMessages", error, {
         accountId,
       });
-      return [];
+      throw error;
     });
 
     return messages
-      .filter((message) => !targetUserId || message.senderId === targetUserId)
+      .filter(
+        (message) =>
+          !targetUserId ||
+          message.senderId === targetUserId ||
+          message.conversationId === targetUserId ||
+          message.participantIds.includes(targetUserId),
+      )
       .map((message) =>
         this.buildXDirectMessageMemory(
           runtime,
@@ -1144,6 +1174,9 @@ export class XService extends Service {
         this.buildUserTarget(profile.id, profile.username, 0.95, accountId),
       ];
     } catch (error) {
+      if (!isXUserNotFound(error)) throw error;
+      // error-policy:J4 A typed provider 404 is the designed "no matching X
+      // user" result. Auth, rate-limit, and transport failures still surface.
       logger.debug(
         {
           src: "plugin:x",
@@ -1162,26 +1195,25 @@ export class XService extends Service {
     const accountId = this.resolveAccountId(_context.target, _context);
     const messages = await this.listRecentDirectMessages(accountId, 25).catch(
       (error) => {
-        // error-policy:J7 a DM fetch failure must surface to the agent rather
-        // than reading as no recent targets; degrade to an empty list after
-        // reporting.
+        // error-policy:J7 Report the connector failure to the agent, then keep
+        // it distinct from a legitimately empty recent-target list.
         this.runtime.reportError("XService.listRecentConnectorTargets", error, {
           accountId,
         });
-        return [];
+        throw error;
       },
     );
     const seen = new Set<string>();
     const targets: MessageConnectorTarget[] = [];
     for (const message of messages) {
-      if (!message.senderId || seen.has(message.senderId)) {
+      if (!message.counterpartyId || seen.has(message.counterpartyId)) {
         continue;
       }
-      seen.add(message.senderId);
+      seen.add(message.counterpartyId);
       targets.push(
         this.buildUserTarget(
-          message.senderId,
-          message.senderUsername ?? undefined,
+          message.counterpartyId,
+          message.counterpartyUsername ?? undefined,
           0.8,
           accountId,
         ),
@@ -1221,9 +1253,10 @@ export class XService extends Service {
         handles: { x: profile.username },
         metadata: { xUserId: profile.id, bio: profile.bio, accountId },
       };
-    } catch {
-      // error-policy:J4 an unresolved handle (unknown user) yields no context;
-      // fetchProfile throwing IS the "not found" answer for this lookup.
+    } catch (error) {
+      // error-policy:J4 Only an explicit provider 404 means the X user does not
+      // exist; auth, rate-limit, and transport failures must remain observable.
+      if (!isXUserNotFound(error)) throw error;
       return null;
     }
   }
@@ -1253,62 +1286,36 @@ export class XService extends Service {
     };
   }
 
-  private async getV2DmClient(accountId?: string): Promise<{
-    v2: {
-      sendDmToParticipant?: (
-        participantId: string,
-        body: { text: string },
-      ) => Promise<{ data?: { dm_event_id?: string } }>;
-      listDmEvents?: (opts: Record<string, unknown>) => AsyncIterable<{
-        id?: string;
-        sender_id?: string;
-        dm_conversation_id?: string;
-        recipient_id?: string;
-        participant_ids?: string[];
-        text?: string;
-        created_at?: string;
-        event_type?: string;
-      }> & {
-        includes?: { users?: Array<{ id: string; username?: string }> };
-      };
-    };
-  }> {
-    const base = (await this.getTwitterClientForAccount(accountId)).client;
-    return (await base.twitterClient.getV2Client()) as unknown as {
-      v2: {
-        sendDmToParticipant?: (
-          participantId: string,
-          body: { text: string },
-        ) => Promise<{ data?: { dm_event_id?: string } }>;
-        listDmEvents?: (opts: Record<string, unknown>) => AsyncIterable<{
-          id?: string;
-          sender_id?: string;
-          dm_conversation_id?: string;
-          recipient_id?: string;
-          participant_ids?: string[];
-          text?: string;
-          created_at?: string;
-          event_type?: string;
-        }> & {
-          includes?: { users?: Array<{ id: string; username?: string }> };
-        };
-      };
-    };
-  }
-
   private async sendXDirectMessage(
-    accountId: string,
+    base: ClientBase,
+    session: TwitterAccountSession,
     recipient: string,
     text: string,
   ): Promise<{ messageId: string | null }> {
-    const client = await this.getV2DmClient(accountId);
-    if (!client.v2.sendDmToParticipant) {
-      throw new Error(
-        "X v2 client does not expose sendDmToParticipant; DM send requires DM API scopes.",
-      );
+    this.assertDmSessionCurrent(base, session);
+    const result = await session.client.v2.sendDmToParticipant(recipient, {
+      text,
+    });
+    return { messageId: normalizeXReceiptId(result.dm_event_id) ?? null };
+  }
+
+  private async withDmSession<T>(
+    accountId: string | undefined,
+    operation: (base: ClientBase, session: TwitterAccountSession) => Promise<T>,
+  ): Promise<T> {
+    const base = (await this.getTwitterClientForAccount(accountId)).client;
+    return base.withAuthenticatedSession((session) => operation(base, session));
+  }
+
+  private assertDmSessionCurrent(
+    base: ClientBase,
+    session: TwitterAccountSession,
+  ): void {
+    if (!base.isAuthenticatedSessionCurrent(session)) {
+      throw new ElizaError("X credentials rotated before direct-message send", {
+        code: "X_AUTH_SESSION_ROTATED",
+      });
     }
-    const result = await client.v2.sendDmToParticipant(recipient, { text });
-    return { messageId: result.data?.dm_event_id ?? null };
   }
 
   private async resolveDmRecipient(
@@ -1349,6 +1356,8 @@ export class XService extends Service {
       createdAt: string | null;
       isInbound: boolean;
       participantIds: string[];
+      counterpartyId: string | null;
+      counterpartyUsername: string | null;
     }>
   > {
     const base = (await this.getTwitterClientForAccount(accountId)).client;
@@ -1388,27 +1397,36 @@ export class XService extends Service {
         createdAt: string | null;
         isInbound: boolean;
         participantIds: string[];
+        counterpartyId: string | null;
+        counterpartyUsername: string | null;
       }> = [];
       for await (const event of iterator) {
         if (event.event_type && event.event_type !== "MessageCreate") {
           continue;
         }
+        const senderId = event.sender_id ?? "";
+        const participantIds = Array.isArray(event.participant_ids)
+          ? event.participant_ids
+          : [];
+        const isInbound = senderId.length > 0 ? senderId !== profile.id : true;
+        const counterpartyId = isInbound
+          ? senderId || null
+          : (participantIds.find(
+              (participantId) => participantId !== profile.id,
+            ) ?? null);
         messages.push({
           id: event.id ?? "",
           conversationId: event.dm_conversation_id ?? event.id ?? "",
-          senderId: event.sender_id ?? "",
-          senderUsername: event.sender_id
-            ? (usernameMap.get(event.sender_id) ?? null)
-            : null,
+          senderId,
+          senderUsername: senderId ? (usernameMap.get(senderId) ?? null) : null,
           text: event.text ?? "",
           createdAt: event.created_at ?? null,
-          isInbound:
-            profile.id && event.sender_id
-              ? event.sender_id !== profile.id
-              : true,
-          participantIds: Array.isArray(event.participant_ids)
-            ? event.participant_ids
-            : [],
+          isInbound,
+          participantIds,
+          counterpartyId,
+          counterpartyUsername: counterpartyId
+            ? (usernameMap.get(counterpartyId) ?? null)
+            : null,
         });
         if (messages.length >= limit) {
           break;
@@ -1437,6 +1455,8 @@ export class XService extends Service {
       metrics?: unknown;
       metadata?: Record<string, unknown>;
       accountId?: string;
+      ownUserId?: string;
+      conversationId?: string;
     },
   ): Memory {
     const accountId = normalizeXAccountId(
@@ -1444,19 +1464,18 @@ export class XService extends Service {
     );
     const authorId = post.userId || "unknown";
     const createdAt = post.createdAt;
-    const entityId =
-      authorId === runtime.agentId
-        ? runtime.agentId
-        : createUniqueUuid(runtime, `x:user:${authorId}`);
+    const isOwn = Boolean(post.ownUserId && authorId === post.ownUserId);
+    const entityId = isOwn
+      ? runtime.agentId
+      : createUniqueUuid(runtime, authorId);
     const roomId =
-      post.roomId ??
-      createUniqueUuid(runtime, `x:${accountId}:feed:${authorId}`);
+      post.roomId ?? createUniqueUuid(runtime, post.conversationId ?? post.id);
     const url = post.username
       ? `https://x.com/${post.username}/status/${post.id}`
       : `https://x.com/i/web/status/${post.id}`;
 
     return {
-      id: createUniqueUuid(runtime, `x:post:${post.id}`),
+      id: createUniqueUuid(runtime, post.id),
       agentId: runtime.agentId,
       entityId,
       roomId,
@@ -1467,7 +1486,7 @@ export class XService extends Service {
         url,
         channelType: ChannelType.FEED,
         ...(post.inReplyTo
-          ? { inReplyTo: createUniqueUuid(runtime, `x:post:${post.inReplyTo}`) }
+          ? { inReplyTo: createUniqueUuid(runtime, post.inReplyTo) }
           : {}),
       },
       metadata: {
@@ -1476,7 +1495,7 @@ export class XService extends Service {
         accountId,
         provider: "x",
         timestamp: createdAt,
-        fromBot: entityId === runtime.agentId,
+        fromBot: isOwn,
         messageIdFull: post.id,
         chatType: ChannelType.FEED,
         sender: {
@@ -1518,14 +1537,17 @@ export class XService extends Service {
       : Date.now();
     const roomId =
       target?.roomId ??
-      createUniqueUuid(runtime, `x:${normalizedAccountId}:dm:${senderId}`);
-    const entityId =
-      senderId === runtime.agentId
-        ? runtime.agentId
-        : createUniqueUuid(runtime, `x:user:${senderId}`);
+      createUniqueUuid(
+        runtime,
+        `x-dm:${normalizedAccountId}:${message.conversationId || senderId}`,
+      );
+    const isOwn = message.isInbound === false;
+    const entityId = isOwn
+      ? runtime.agentId
+      : createUniqueUuid(runtime, senderId);
 
     return {
-      id: createUniqueUuid(runtime, `x:dm:${message.id}`),
+      id: createUniqueUuid(runtime, `x-dm:${message.id}`),
       agentId: runtime.agentId,
       entityId,
       roomId,
@@ -1541,7 +1563,7 @@ export class XService extends Service {
         accountId: normalizedAccountId,
         provider: "x",
         timestamp: createdAt,
-        fromBot: entityId === runtime.agentId,
+        fromBot: isOwn,
         messageIdFull: message.id,
         chatType: ChannelType.DM,
         sender: {

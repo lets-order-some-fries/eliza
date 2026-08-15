@@ -247,7 +247,30 @@ export class ClientBase {
 
   requestQueue: RequestQueue = new RequestQueue();
 
-  profile: TwitterProfile | null = null;
+  private synchronizedProfile: TwitterProfile | null = null;
+  private synchronizedProfileSession: Pick<
+    TwitterAccountSession,
+    "client" | "revision"
+  > | null = null;
+  private readonly publishLegacyIdentity: boolean;
+  private readonly legacyCacheUsernames = new Map<string, string>();
+  private latestCursorWrite: Promise<void> = Promise.resolve();
+
+  get profile(): TwitterProfile | null {
+    if (!this.synchronizedProfile || !this.synchronizedProfileSession) {
+      return this.synchronizedProfile;
+    }
+    return this.twitterClient.isAuthenticatedSessionCurrent(
+      this.synchronizedProfileSession,
+    )
+      ? this.synchronizedProfile
+      : null;
+  }
+
+  set profile(profile: TwitterProfile | null) {
+    this.synchronizedProfile = profile;
+    this.synchronizedProfileSession = null;
+  }
 
   /**
    * Caches a tweet in the database.
@@ -261,7 +284,7 @@ export class ClientBase {
       return;
     }
 
-    this.runtime.setCache<Tweet>(`twitter/tweets/${tweet.id}`, tweet);
+    await this.runtime.setCache<Tweet>(`twitter/tweets/${tweet.id}`, tweet);
   }
 
   /**
@@ -319,7 +342,11 @@ export class ClientBase {
 
   state: TwitterClientState;
 
-  constructor(runtime: IAgentRuntime, state: TwitterClientState) {
+  constructor(
+    runtime: IAgentRuntime,
+    state: TwitterClientState,
+    options: { publishLegacyIdentity?: boolean } = {},
+  ) {
     this.runtime = runtime;
     this.state = state;
     this.accountId = resolveRequestedXAccountId(
@@ -327,7 +354,50 @@ export class ClientBase {
       state,
       state.accountId,
     );
+    this.publishLegacyIdentity = options.publishLegacyIdentity ?? true;
     this.twitterClient = new Client();
+  }
+
+  identityCacheKey(profile: TwitterProfile, suffix: string): string {
+    return `twitter/${encodeURIComponent(this.accountId)}/${profile.id}/${suffix}`;
+  }
+
+  async getIdentityCache<T>(
+    profile: TwitterProfile,
+    suffix: string,
+  ): Promise<T | undefined> {
+    const key = this.identityCacheKey(profile, suffix);
+    const current = await this.runtime.getCache<T>(key);
+    const legacyUsername = this.legacyCacheUsernames.get(profile.id);
+    if (current !== undefined || !legacyUsername) {
+      return current;
+    }
+    const legacy = await this.runtime.getCache<T>(
+      `twitter/${legacyUsername}/${suffix}`,
+    );
+    if (legacy !== undefined) {
+      await this.runtime.setCache(key, legacy);
+    }
+    return legacy;
+  }
+
+  async setIdentityCache<T>(
+    profile: TwitterProfile,
+    suffix: string,
+    value: T,
+    session?: TwitterAccountSession,
+  ): Promise<void> {
+    if (session && !this.isAuthenticatedSessionCurrent(session)) {
+      throw new ElizaError("X credentials rotated before cache persistence", {
+        code: "X_AUTH_SESSION_ROTATED",
+      });
+    }
+    await this.runtime.setCache(this.identityCacheKey(profile, suffix), value);
+    if (session && !this.isAuthenticatedSessionCurrent(session)) {
+      throw new ElizaError("X credentials rotated during cache persistence", {
+        code: "X_AUTH_SESSION_ROTATED",
+      });
+    }
   }
 
   private async synchronizeAuthenticatedSession(
@@ -363,7 +433,9 @@ export class ClientBase {
       this.lastCheckedTweetProfileId = nextProfile.id;
     }
 
-    const entity = await this.runtime.getEntityById(this.runtime.agentId);
+    const entity = this.publishLegacyIdentity
+      ? await this.runtime.getEntityById(this.runtime.agentId)
+      : null;
     const entityMetadata = entity?.metadata as
       | {
           twitter?: {
@@ -376,10 +448,17 @@ export class ClientBase {
         }
       | undefined;
     const storedIdentity = entityMetadata?.twitter;
+    if (this.publishLegacyIdentity && storedIdentity?.id === nextProfile.id) {
+      this.legacyCacheUsernames.set(
+        nextProfile.id,
+        storedIdentity.userName ?? nextProfile.username,
+      );
+    }
     if (
-      storedIdentity?.id !== nextProfile.id ||
-      storedIdentity?.userName !== nextProfile.username ||
-      storedIdentity?.name !== nextProfile.screenName
+      this.publishLegacyIdentity &&
+      (storedIdentity?.id !== nextProfile.id ||
+        storedIdentity?.userName !== nextProfile.username ||
+        storedIdentity?.name !== nextProfile.screenName)
     ) {
       const priorXNames = new Set(
         [storedIdentity?.userName, storedIdentity?.name]
@@ -413,7 +492,21 @@ export class ClientBase {
       });
     }
 
-    this.profile = nextProfile;
+    if (identityChanged) {
+      const latestCheckedTweetId = await this.getIdentityCache<string>(
+        nextProfile,
+        "latest_checked_tweet_id",
+      );
+      this.lastCheckedTweetProfileId = nextProfile.id;
+      this.lastCheckedTweetId = latestCheckedTweetId
+        ? BigInt(latestCheckedTweetId)
+        : null;
+    }
+    this.synchronizedProfile = nextProfile;
+    this.synchronizedProfileSession = {
+      client: session.client,
+      revision: session.revision,
+    };
     return {
       client: session.client,
       profile: nextProfile,
@@ -424,13 +517,21 @@ export class ClientBase {
   async withAuthenticatedSession<T>(
     operation: (session: TwitterAccountSession) => Promise<T>,
   ): Promise<T> {
-    return this.twitterClient.withAuthenticatedSession(async (session) => {
-      const synchronized = await this.twitterClient.withCurrentSession(
-        session,
-        () => this.synchronizeAuthenticatedSession(session),
+    try {
+      return await this.twitterClient.withAuthenticatedSession(
+        async (session) => {
+          const synchronized = await this.twitterClient.withCurrentSession(
+            session,
+            () => this.synchronizeAuthenticatedSession(session),
+          );
+          return operation(synchronized);
+        },
       );
-      return operation(synchronized);
-    });
+    } catch (error) {
+      this.synchronizedProfile = null;
+      this.synchronizedProfileSession = null;
+      throw error;
+    }
   }
 
   async getAuthenticatedSession(): Promise<TwitterAccountSession> {
@@ -516,7 +617,6 @@ export class ClientBase {
 
     await this.getAuthenticatedProfile();
 
-    await this.loadLatestCheckedTweetId();
     await this.populateTimeline();
   }
 
@@ -554,34 +654,46 @@ export class ClientBase {
     searchMode: SearchMode,
     cursor?: string,
   ): Promise<QueryTweetsResponse> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      // Sometimes this fails because we are rate limited. in this case, we just need to return an empty array
-      // if we dont get a response in 5 seconds, something is wrong
-      const timeoutPromise = new Promise((resolve) =>
-        setTimeout(() => resolve({ tweets: [] }), 15000),
-      );
-
-      try {
-        const result = await this.requestQueue.add(
-          async () =>
-            await Promise.race([
-              this.twitterClient.fetchSearchTweets(
-                query,
-                maxTweets,
-                searchMode,
-                cursor,
-              ),
-              timeoutPromise,
-            ]),
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () =>
+            reject(
+              new ElizaError("X search timed out", {
+                code: "X_SEARCH_TIMEOUT",
+              }),
+            ),
+          15_000,
         );
-        return (result ?? { tweets: [] }) as QueryTweetsResponse;
-      } catch (error) {
-        logger.error("Error fetching search tweets:", errorDetail(error));
-        return { tweets: [] };
+      });
+      const result = await this.requestQueue.add(() =>
+        Promise.race([
+          this.twitterClient.fetchSearchTweets(
+            query,
+            maxTweets,
+            searchMode,
+            cursor,
+          ),
+          timeoutPromise,
+        ]),
+      );
+      if (!result) {
+        throw new ElizaError("X search returned no response", {
+          code: "X_SEARCH_RESPONSE_INVALID",
+        });
       }
+      return result as QueryTweetsResponse;
     } catch (error) {
-      logger.error("Error fetching search tweets:", errorDetail(error));
-      return { tweets: [] };
+      if (error instanceof ElizaError) throw error;
+      // error-policy:J2 preserve the provider failure as the cause while adding
+      // the connector operation context expected by agent-facing boundaries.
+      throw new ElizaError("Failed to fetch X search results", {
+        code: "X_SEARCH_FAILED",
+        cause: error,
+      });
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
   }
 
@@ -875,10 +987,17 @@ export class ClientBase {
   }
 
   async loadLatestCheckedTweetId(): Promise<void> {
-    await this.withAuthenticatedSession(async ({ profile }) => {
-      const latestCheckedTweetId = await this.runtime.getCache<string>(
-        `twitter/${profile.username}/latest_checked_tweet_id`,
+    await this.withAuthenticatedSession(async (session) => {
+      const { profile } = session;
+      const latestCheckedTweetId = await this.getIdentityCache<string>(
+        profile,
+        "latest_checked_tweet_id",
       );
+      if (!this.isAuthenticatedSessionCurrent(session)) {
+        throw new ElizaError("X credentials rotated while loading cursor", {
+          code: "X_AUTH_SESSION_ROTATED",
+        });
+      }
       this.lastCheckedTweetProfileId = profile.id;
       this.lastCheckedTweetId = latestCheckedTweetId
         ? BigInt(latestCheckedTweetId)
@@ -895,15 +1014,20 @@ export class ClientBase {
       );
     }
     const profile = authenticatedProfile;
-    if (
-      this.lastCheckedTweetId !== null &&
-      this.lastCheckedTweetProfileId === profile.id
-    ) {
-      await this.runtime.setCache<string>(
-        `twitter/${profile.username}/latest_checked_tweet_id`,
-        this.lastCheckedTweetId.toString(),
-      );
-    }
+    const write = this.latestCursorWrite.then(async () => {
+      if (
+        this.lastCheckedTweetId !== null &&
+        this.lastCheckedTweetProfileId === profile.id
+      ) {
+        await this.setIdentityCache(
+          profile,
+          "latest_checked_tweet_id",
+          this.lastCheckedTweetId.toString(),
+        );
+      }
+    });
+    this.latestCursorWrite = write.catch(() => undefined);
+    await write;
   }
 
   getLatestCheckedTweetId(profileId: string): bigint | null {
@@ -931,8 +1055,9 @@ export class ClientBase {
     profile?: TwitterProfile,
   ): Promise<Tweet[] | undefined> {
     const currentProfile = profile ?? (await this.getAuthenticatedProfile());
-    const cached = await this.runtime.getCache<Tweet[]>(
-      `twitter/${currentProfile.username}/timeline`,
+    const cached = await this.getIdentityCache<Tweet[]>(
+      currentProfile,
+      "timeline",
     );
 
     if (!cached) {
@@ -944,18 +1069,12 @@ export class ClientBase {
 
   async cacheTimeline(timeline: Tweet[], profile?: TwitterProfile) {
     const currentProfile = profile ?? (await this.getAuthenticatedProfile());
-    await this.runtime.setCache<Tweet[]>(
-      `twitter/${currentProfile.username}/timeline`,
-      timeline,
-    );
+    await this.setIdentityCache(currentProfile, "timeline", timeline);
   }
 
   async cacheMentions(mentions: Tweet[], profile?: TwitterProfile) {
     const currentProfile = profile ?? (await this.getAuthenticatedProfile());
-    await this.runtime.setCache<Tweet[]>(
-      `twitter/${currentProfile.username}/mentions`,
-      mentions,
-    );
+    await this.setIdentityCache(currentProfile, "mentions", mentions);
   }
 
   async fetchProfile(username: string): Promise<TwitterProfile> {
@@ -1000,6 +1119,26 @@ export class ClientBase {
 
       return profile;
     } catch (error) {
+      const candidate =
+        typeof error === "object" && error !== null
+          ? (error as {
+              code?: unknown;
+              status?: unknown;
+              statusCode?: unknown;
+            })
+          : null;
+      const status = [
+        candidate?.code,
+        candidate?.status,
+        candidate?.statusCode,
+      ].find((value): value is number => typeof value === "number");
+      if (status === 404) {
+        throw new ElizaError(`X profile @${username} was not found`, {
+          code: "X_PROFILE_NOT_FOUND",
+          cause: error,
+          context: { username },
+        });
+      }
       logger.error("Error fetching Twitter profile:", errorDetail(error));
       throw error;
     }

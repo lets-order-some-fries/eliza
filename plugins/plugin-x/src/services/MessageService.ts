@@ -3,9 +3,10 @@
  * messages, sending and listing DMs through `ClientBase`. Backs the message
  * connector handlers and the LifeOps DM adapter.
  */
-import { createUniqueUuid, logger, type UUID } from "@elizaos/core";
+import { createUniqueUuid, ElizaError, logger, type UUID } from "@elizaos/core";
 import type { ClientBase } from "../base";
 import { SearchMode } from "../client";
+import { extractXWriteReceiptId } from "../utils/provider-receipt";
 import { getEpochMs } from "../utils/time";
 import {
   type GetMessagesOptions,
@@ -20,51 +21,6 @@ export class TwitterMessageService implements IMessageService {
 
   private errorDetail(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
-  }
-
-  private extractRestId(result: unknown): string | undefined {
-    const r = result as {
-      rest_id?: unknown;
-      data?: {
-        create_tweet?: { tweet_results?: { result?: { rest_id?: unknown } } };
-        data?: {
-          create_tweet?: { tweet_results?: { result?: { rest_id?: unknown } } };
-        };
-      };
-    } | null;
-    const candidate =
-      r?.rest_id ??
-      r?.data?.create_tweet?.tweet_results?.result?.rest_id ??
-      r?.data?.data?.create_tweet?.tweet_results?.result?.rest_id;
-    return typeof candidate === "string" ? candidate : undefined;
-  }
-
-  private async extractResultId(result: unknown): Promise<string | undefined> {
-    const r = result as {
-      id?: unknown;
-      data?: { id?: unknown; data?: { id?: unknown } };
-      json?: unknown;
-    } | null;
-    const direct = r?.id ?? r?.data?.id ?? r?.data?.data?.id;
-    if (typeof direct === "string") return direct;
-    const restId = this.extractRestId(result);
-    if (restId) return restId;
-
-    if (r && typeof r.json === "function") {
-      try {
-        const body = (await (r.json as () => Promise<unknown>)()) as {
-          id?: unknown;
-          data?: { id?: unknown; data?: { id?: unknown } };
-        } | null;
-        const viaBody = body?.id ?? body?.data?.id ?? body?.data?.data?.id;
-        if (typeof viaBody === "string") return viaBody;
-        return this.extractRestId(body);
-      } catch {
-        return undefined;
-      }
-    }
-
-    return undefined;
   }
 
   async getMessages(options: GetMessagesOptions): Promise<Message[]> {
@@ -117,17 +73,23 @@ export class TwitterMessageService implements IMessageService {
         return messages;
       });
     } catch (error) {
-      // error-policy:J7 a DM fetch failure must surface to the agent (RECENT_ERRORS)
-      // rather than reading as an empty inbox; degrade to no messages after reporting.
+      // error-policy:J7 Report the connector failure to the agent, then keep it
+      // distinct from a legitimately empty inbox.
       this.client.runtime.reportError("XMessageService.getMessages", error);
-      return [];
+      throw error;
     }
   }
 
   async sendMessage(options: SendMessageOptions): Promise<Message> {
-    return this.client.withAuthenticatedSession(async ({ profile }) => {
+    return this.client.withAuthenticatedSession(async (session) => {
+      const { profile } = session;
       try {
         let result: unknown;
+        if (!this.client.isAuthenticatedSessionCurrent(session)) {
+          throw new ElizaError("X credentials rotated before message egress", {
+            code: "X_AUTH_SESSION_ROTATED",
+          });
+        }
 
         if (options.type === MessageType.DIRECT_MESSAGE) {
           // Send direct message using the roomId as conversationId
@@ -143,13 +105,23 @@ export class TwitterMessageService implements IMessageService {
           );
         }
 
-        const extractedId = await this.extractResultId(result);
-        const resultId = (result as { id?: unknown } | null)?.id;
-        const messageId =
-          extractedId ?? (typeof resultId === "string" ? resultId : "");
+        const extractedId = await extractXWriteReceiptId(result);
+        if (!extractedId) {
+          throw new ElizaError(
+            "X accepted the message but returned no usable receipt; do not retry blindly",
+            {
+              code: "X_MESSAGE_RECEIPT_INDETERMINATE",
+              context: {
+                accountId: this.client.accountId,
+                providerAccepted: true,
+                retrySafe: false,
+              },
+            },
+          );
+        }
 
         const message: Message = {
-          id: messageId,
+          id: extractedId,
           agentId: options.agentId,
           roomId: options.roomId,
           userId: profile.id,
@@ -210,10 +182,10 @@ export class TwitterMessageService implements IMessageService {
 
       return message;
     } catch (error) {
-      // error-policy:J7 a message-fetch failure must surface to the agent rather
-      // than reading as "no such message"; degrade to null after reporting.
+      // error-policy:J7 Report the connector failure to the agent, then keep it
+      // distinct from the legitimate null returned for a missing message.
       this.client.runtime.reportError("XMessageService.getMessage", error);
-      return null;
+      throw error;
     }
   }
 

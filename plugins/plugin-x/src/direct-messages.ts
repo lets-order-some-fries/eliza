@@ -23,7 +23,9 @@ import {
 } from "@elizaos/core";
 import type { ClientBase, TwitterAccountSession } from "./base";
 import type { TwitterClientState } from "./types";
+import { isExplicitTwitterRejection } from "./utils/error-handler";
 import { createMemorySafe, reconcileTwitterWorld } from "./utils/memory";
+import { normalizeXReceiptId } from "./utils/provider-receipt";
 import { getSetting } from "./utils/settings";
 
 interface DirectMessageEvent {
@@ -199,7 +201,14 @@ export class TwitterDirectMessageClient {
   }
 
   private async processNewMessages(): Promise<void> {
-    const session = await this.client.getAuthenticatedSession();
+    await this.client.withAuthenticatedSession((session) =>
+      this.processNewMessagesForSession(session),
+    );
+  }
+
+  private async processNewMessagesForSession(
+    session: TwitterAccountSession,
+  ): Promise<void> {
     const { client: api, profile } = session;
 
     const stateKeyPrefix = `twitter/${this.client.accountId}/${profile.id}`;
@@ -358,7 +367,7 @@ export class TwitterDirectMessageClient {
     await this.runtime.ensureConnection({
       entityId,
       roomId,
-      userId: entityId,
+      userId: senderId,
       userName: username,
       name: displayName,
       source: "x",
@@ -444,7 +453,20 @@ export class TwitterDirectMessageClient {
       // no-replay barrier before the request so a crash, timeout, or receipt
       // persistence failure cannot cause a second externally visible reply.
       // An explicit provider rejection clears the barrier below and may retry.
-      await this.runtime.setCache(settledKey, "egress_started");
+      try {
+        await this.runtime.setCache(settledKey, "egress_started");
+      } catch (error) {
+        deliveryError = error;
+        throw error;
+      }
+      if (!this.client.isAuthenticatedSessionCurrent(session)) {
+        await this.runtime.deleteCache(settledKey);
+        deliveryError = new ElizaError(
+          "X credentials rotated before the direct-message reply was sent",
+          { code: "X_AUTH_SESSION_ROTATED" },
+        );
+        throw deliveryError;
+      }
       try {
         sent = isGroup
           ? await api.v2.sendDmInConversation(conversationId, { text })
@@ -465,7 +487,9 @@ export class TwitterDirectMessageClient {
         data?: { dm_event_id?: string };
         dm_event_id?: string;
       };
-      const sentId = sentResult.data?.dm_event_id ?? sentResult.dm_event_id;
+      const sentId = normalizeXReceiptId(
+        sentResult.data?.dm_event_id ?? sentResult.dm_event_id,
+      );
       await this.runtime.setCache(
         settledKey,
         sentId ? `delivered:${sentId}` : "delivered",
@@ -558,25 +582,4 @@ export class TwitterDirectMessageClient {
       await this.runtime.setCache(settledKey, "settled_without_reply");
     }
   }
-}
-
-function isExplicitTwitterRejection(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
-  const candidate = error as {
-    code?: unknown;
-    status?: unknown;
-    data?: { status?: unknown };
-    response?: { status?: unknown };
-  };
-  const status =
-    candidate.data?.status ??
-    candidate.response?.status ??
-    candidate.status ??
-    candidate.code;
-  return (
-    typeof status === "number" &&
-    Number.isInteger(status) &&
-    status >= 400 &&
-    status < 500
-  );
 }

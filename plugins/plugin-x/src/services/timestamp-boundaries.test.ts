@@ -57,6 +57,7 @@ function createClient(overrides: Record<string, unknown> = {}): ClientBase {
       nicknames: [],
     })),
     twitterClient: {},
+    isAuthenticatedSessionCurrent: vi.fn(() => true),
     fetchSearchTweets: vi.fn(),
     fetchHomeTimeline: vi.fn(async () => []),
     ...overrides,
@@ -171,6 +172,31 @@ describe("TwitterMessageService mixed valid+corrupt collections (#18965)", () =>
       userId: "account-b",
       username: "current-b",
     });
+  });
+
+  it("never fabricates a successful id when an accepted message has no receipt", async () => {
+    const sendTweet = vi.fn(async () => ({ data: { id: "   " } }));
+    const client = createClient({
+      twitterClient: { sendTweet },
+    });
+    const service = new TwitterMessageService(client);
+
+    await expect(
+      service.sendMessage({
+        agentId: "00000000-0000-0000-0000-000000000001" as UUID,
+        roomId: "00000000-0000-0000-0000-000000000002" as UUID,
+        text: "provider accepted this request",
+        type: MessageType.POST,
+      }),
+    ).rejects.toMatchObject({
+      code: "X_MESSAGE_RECEIPT_INDETERMINATE",
+      context: {
+        accountId: "default",
+        providerAccepted: true,
+        retrySafe: false,
+      },
+    });
+    expect(sendTweet).toHaveBeenCalledOnce();
   });
 });
 

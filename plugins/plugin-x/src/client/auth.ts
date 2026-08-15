@@ -43,17 +43,18 @@ function credentialFingerprint(
 function isCredentialRejection(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const candidate = error as { code?: unknown; isAuthError?: unknown };
-  return (
-    candidate.isAuthError === true ||
-    candidate.code === 401 ||
-    candidate.code === 403
-  );
+  return candidate.isAuthError === true || candidate.code === 401;
 }
 
 type ClientGeneration = {
   id: number;
   fingerprint: string;
   client: TwitterApi;
+};
+
+type SessionContext = {
+  generation: ClientGeneration;
+  active: boolean;
 };
 
 export type AuthenticatedTwitterSession = {
@@ -71,12 +72,17 @@ export class TwitterAuth {
   private lifecycle = 0;
   private authenticated = false;
   private loggedOut = false;
+  private activation: Promise<void> = Promise.resolve();
+  private activeSessions = 0;
+  private admissionBarrier?: { promise: Promise<void>; resolve: () => void };
+  private sessionDrain?: { promise: Promise<void>; resolve: () => void };
   private readonly fingerprintKey = randomBytes(32);
   private generationGate: Promise<void> = Promise.resolve();
-  private readonly sessionContext = new AsyncLocalStorage<ClientGeneration>();
+  private readonly sessionContext = new AsyncLocalStorage<SessionContext>();
   private initialization?: {
     lifecycle: number;
     promise: Promise<ClientGeneration>;
+    state: { revalidationRequested: boolean };
   };
   private profileCache?: { generation: number; profile: Profile };
   private readonly profileLoads = new Map<number, Promise<Profile>>();
@@ -116,6 +122,8 @@ export class TwitterAuth {
   private async initializeClient(lifecycle: number): Promise<ClientGeneration> {
     this.assertActiveLifecycle(lifecycle);
     let credentials: BrokerAuthCredentials;
+    // error-policy:J1 provider boundary translates potentially secret-bearing
+    // credential resolution failures into one safe connector error.
     try {
       credentials = await this.resolveCredentials();
     } catch {
@@ -128,33 +136,59 @@ export class TwitterAuth {
       this.provider.mode,
       credentials,
     );
-    return this.runGenerationExclusive(async () => {
+    const preparation = await this.runGenerationExclusive(async () => {
       this.assertActiveLifecycle(lifecycle);
       if (this.generation?.fingerprint === fingerprint) {
-        return this.generation;
+        return { current: this.generation };
       }
-      const client =
-        credentials.mode === "oauth1"
-          ? new TwitterApi({
-              appKey: credentials.appKey,
-              appSecret: credentials.appSecret,
-              accessToken: credentials.accessToken,
-              accessSecret: credentials.accessSecret,
-            })
-          : new TwitterApi(credentials.accessToken);
-      const generation = {
-        id: ++this.nextGeneration,
-        fingerprint,
-        client,
-      };
-      this.generation = generation;
-      this.profileCache = undefined;
-      this.profileLoads.clear();
-      this.authenticated = true;
-      return generation;
+      return { releaseAdmission: this.closeSessionAdmission() };
     });
-  }
+    if (preparation.current) return preparation.current;
 
+    try {
+      await this.waitForSessions();
+      return await this.runGenerationExclusive(async () => {
+        this.assertActiveLifecycle(lifecycle);
+        if (this.generation?.fingerprint === fingerprint) {
+          return this.generation;
+        }
+        // Once a different tuple owns admission, the previous identity is no
+        // longer valid even if constructing the replacement client fails.
+        this.generation = undefined;
+        this.profileCache = undefined;
+        this.profileLoads.clear();
+        this.authenticated = false;
+        let client: TwitterApi;
+        // error-policy:J1 the library constructor may echo credential values in
+        // validation errors, so this boundary deliberately drops its payload.
+        try {
+          client =
+            credentials.mode === "oauth1"
+              ? new TwitterApi({
+                  appKey: credentials.appKey,
+                  appSecret: credentials.appSecret,
+                  accessToken: credentials.accessToken,
+                  accessSecret: credentials.accessSecret,
+                })
+              : new TwitterApi(credentials.accessToken);
+        } catch {
+          throw new ElizaError("Failed to initialize X API client", {
+            code: "X_AUTH_INITIALIZATION_FAILED",
+          });
+        }
+        const generation = {
+          id: ++this.nextGeneration,
+          fingerprint,
+          client,
+        };
+        this.generation = generation;
+        this.authenticated = true;
+        return generation;
+      });
+    } finally {
+      preparation.releaseAdmission?.();
+    }
+  }
   private assertActiveLifecycle(lifecycle: number): void {
     if (this.loggedOut || this.lifecycle !== lifecycle) {
       throw new ElizaError("Twitter API client not initialized", {
@@ -184,14 +218,15 @@ export class TwitterAuth {
   }
 
   private async ensureClientInitialized(): Promise<ClientGeneration> {
-    const pinned = this.sessionContext.getStore();
-    if (pinned) {
+    await this.activation;
+    const context = this.sessionContext.getStore();
+    if (context?.active) {
       if (this.loggedOut) {
         throw new ElizaError("Twitter API client not initialized", {
           code: "X_AUTH_NOT_INITIALIZED",
         });
       }
-      return pinned;
+      return context.generation;
     }
     if (this.loggedOut) {
       throw new ElizaError("Twitter API client not initialized", {
@@ -200,11 +235,16 @@ export class TwitterAuth {
     }
     const lifecycle = this.lifecycle;
     if (this.initialization?.lifecycle === lifecycle) {
+      // Providers expose no credential revision, so a follower may represent a
+      // newer tuple even during first initialization. Followers share one
+      // subsequent read; identical tuples still reuse the client and profile.
+      this.initialization.state.revalidationRequested = true;
       return this.initialization.promise;
     }
 
-    const promise = this.initializeClient(lifecycle);
-    const initialization = { lifecycle, promise };
+    const state = { revalidationRequested: false };
+    const promise = this.runInitializationFlight(lifecycle, state);
+    const initialization = { lifecycle, promise, state };
     this.initialization = initialization;
     try {
       return await promise;
@@ -215,7 +255,21 @@ export class TwitterAuth {
     }
   }
 
+  private async runInitializationFlight(
+    lifecycle: number,
+    state: { revalidationRequested: boolean },
+  ): Promise<ClientGeneration> {
+    let generation: ClientGeneration;
+    do {
+      state.revalidationRequested = false;
+      generation = await this.initializeClient(lifecycle);
+    } while (state.revalidationRequested);
+    return generation;
+  }
+
   private async fetchProfile(client: TwitterApi): Promise<Profile> {
+    // error-policy:J1 X API boundary classifies credential rejection while
+    // stripping provider payloads, tokens, and transport details.
     try {
       const { data: user } = await client.v2.me({
         "user.fields": [
@@ -326,19 +380,33 @@ export class TwitterAuth {
   async withAuthenticatedSession<T>(
     operation: (session: AuthenticatedTwitterSession) => Promise<T>,
   ): Promise<T> {
-    const pinned = this.sessionContext.getStore();
-    if (pinned) {
-      const profile = await this.profileFor(pinned);
-      return operation({
-        client: pinned.client,
-        profile,
-        revision: pinned.id,
-      });
+    const context = this.sessionContext.getStore();
+    if (context?.active) {
+      if (this.loggedOut) {
+        throw new ElizaError("Twitter API client not initialized", {
+          code: "X_AUTH_NOT_INITIALIZED",
+        });
+      }
+      const profile = await this.profileFor(context.generation);
+      if (context.active) {
+        if (this.loggedOut) {
+          throw new ElizaError("Twitter API client not initialized", {
+            code: "X_AUTH_NOT_INITIALIZED",
+          });
+        }
+        return operation({
+          client: context.generation.client,
+          profile,
+          revision: context.generation.id,
+        });
+      }
     }
 
     while (true) {
       const generation = await this.ensureClientInitialized();
       let profile: Profile;
+      // error-policy:J7 a superseded generation's profile failure is observed
+      // by the current-generation retry; current failures still propagate.
       try {
         profile = await this.profileFor(generation);
       } catch (error) {
@@ -346,13 +414,21 @@ export class TwitterAuth {
         continue;
       }
       if (!this.isCurrent(generation)) continue;
-      return this.sessionContext.run(generation, () =>
-        operation({
-          client: generation.client,
-          profile,
-          revision: generation.id,
-        }),
-      );
+      const release = await this.acquireSession(generation);
+      if (!release) continue;
+      const activeContext: SessionContext = { generation, active: true };
+      try {
+        return await this.sessionContext.run(activeContext, () =>
+          operation({
+            client: generation.client,
+            profile,
+            revision: generation.id,
+          }),
+        );
+      } finally {
+        activeContext.active = false;
+        release();
+      }
     }
   }
 
@@ -376,12 +452,24 @@ export class TwitterAuth {
           code: "X_AUTH_SESSION_ROTATED",
         });
       }
-      return operation();
+      const result = await operation();
+      if (!this.isAuthenticatedSessionCurrent(session)) {
+        throw new ElizaError("X credentials rotated during identity refresh", {
+          code: "X_AUTH_SESSION_ROTATED",
+        });
+      }
+      return result;
     });
   }
 
   /** Invalidates this credential object before a Client replaces it. */
   invalidate(): void {
+    if (this.sessionContext.getStore()?.active) {
+      throw new ElizaError(
+        "Cannot replace X credentials inside an authenticated operation",
+        { code: "X_AUTH_REPLACEMENT_DURING_SESSION" },
+      );
+    }
     if (this.loggedOut) return;
     this.loggedOut = true;
     this.lifecycle += 1;
@@ -393,11 +481,75 @@ export class TwitterAuth {
     this.fingerprintKey.fill(0);
   }
 
+  private closeSessionAdmission(): () => void {
+    if (this.admissionBarrier) {
+      throw new ElizaError("X credential rotation is already in progress", {
+        code: "X_AUTH_ROTATION_CONFLICT",
+      });
+    }
+    let resolve!: () => void;
+    const promise = new Promise<void>((onResolve) => {
+      resolve = onResolve;
+    });
+    const barrier = { promise, resolve };
+    this.admissionBarrier = barrier;
+    return () => {
+      if (this.admissionBarrier !== barrier) return;
+      this.admissionBarrier = undefined;
+      barrier.resolve();
+    };
+  }
+
+  private async acquireSession(
+    generation: ClientGeneration,
+  ): Promise<(() => void) | undefined> {
+    while (this.admissionBarrier) {
+      await this.admissionBarrier.promise;
+    }
+    if (this.loggedOut) {
+      throw new ElizaError("Twitter API client not initialized", {
+        code: "X_AUTH_NOT_INITIALIZED",
+      });
+    }
+    if (!this.isCurrent(generation)) return undefined;
+    this.activeSessions += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activeSessions -= 1;
+      if (this.activeSessions === 0 && this.sessionDrain) {
+        this.sessionDrain.resolve();
+        this.sessionDrain = undefined;
+      }
+    };
+  }
+
+  private waitForSessions(): Promise<void> {
+    if (this.activeSessions === 0) return Promise.resolve();
+    if (!this.sessionDrain) {
+      let resolve!: () => void;
+      const promise = new Promise<void>((onResolve) => {
+        resolve = onResolve;
+      });
+      this.sessionDrain = { promise, resolve };
+    }
+    return this.sessionDrain.promise;
+  }
+
+  /** Defers this credential object's first use until the prior auth is quiescent. */
+  deferUntil(barrier: Promise<void>): void {
+    this.activation = Promise.all([this.activation, barrier]).then(
+      () => undefined,
+    );
+  }
+
   /**
    * Logout (clear credentials)
    */
   async logout(): Promise<void> {
     this.invalidate();
+    await Promise.all([this.activation, this.waitForSessions()]);
     await this.runGenerationExclusive(async () => undefined);
   }
 

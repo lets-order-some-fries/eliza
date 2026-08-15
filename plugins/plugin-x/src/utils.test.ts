@@ -1,9 +1,9 @@
 /** Verifies accepted X sends remain single-shot while account-bound cursor and cache receipts stay monotonic across rotation. */
-import type { IAgentRuntime } from "@elizaos/core";
+import type { IAgentRuntime, UUID } from "@elizaos/core";
 import { describe, expect, it, vi } from "vitest";
 import { ClientBase, type TwitterProfile } from "./base";
 import type { TwitterClientState } from "./types";
-import { sendTweet } from "./utils";
+import { sendChunkedTweet, sendTweet } from "./utils";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -27,51 +27,52 @@ describe("sendTweet", () => {
   it("returns the accepted tweet when local cache bookkeeping fails after publish", async () => {
     const authenticatedProfile = profile("account-a");
     const reportError = vi.fn();
-    const client = {
-      lastCheckedTweetId: null,
-      accountId: "default",
-      runtime: { reportError },
-      withAuthenticatedSession: async (
-        operation: (session: {
-          client: unknown;
-          profile: TwitterProfile;
-          revision: number;
-        }) => Promise<unknown>,
-      ) =>
-        operation({
-          client: {},
-          profile: authenticatedProfile,
-          revision: 1,
-        }),
-      twitterClient: {
-        sendTweet: vi.fn().mockResolvedValue({
-          data: {
-            data: {
-              id: "123",
-              text: "hello",
-            },
-          },
-        }),
-      },
-      cacheLatestCheckedTweetId: vi
-        .fn()
-        .mockRejectedValue(new Error("cache unavailable")),
-      recordLatestCheckedTweetId: vi.fn(),
-      cacheTweet: vi.fn(),
-    } as unknown as ClientBase;
+    const setCache = vi.fn(async (key: string) => {
+      if (key.endsWith("latest_checked_tweet_id")) {
+        throw new Error("cache unavailable");
+      }
+    });
+    const runtime = {
+      agentId: "agent-1",
+      character: { name: "Agent" },
+      getSetting: () => undefined,
+      getCache: vi.fn(async () => undefined),
+      setCache,
+      reportError,
+    } as unknown as IAgentRuntime;
+    const client = new ClientBase(runtime, {} as TwitterClientState);
+    const send = vi.fn().mockResolvedValue({
+      data: { data: { id: "123", text: "hello" } },
+    });
+    client.profile = authenticatedProfile;
+    client.twitterClient = {
+      sendTweet: send,
+    } as unknown as ClientBase["twitterClient"];
+    client.withAuthenticatedSession = async (operation) =>
+      operation({
+        client: {} as never,
+        profile: authenticatedProfile,
+        revision: 1,
+      });
+    client.isAuthenticatedSessionCurrent = () => true;
 
     await expect(sendTweet(client, "hello")).resolves.toMatchObject({
       id: "123",
       text: "hello",
     });
-    expect(client.twitterClient.sendTweet).toHaveBeenCalledTimes(1);
-    expect(client.cacheLatestCheckedTweetId).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(setCache).toHaveBeenCalledWith(
+      "twitter/default/account-a/latest_checked_tweet_id",
+      "123",
+    );
     expect(reportError).toHaveBeenCalledWith(
       "X.sendTweet.localReceipt",
       expect.any(Error),
       { accountId: "default", tweetId: "123" },
     );
-    expect(client.cacheTweet).not.toHaveBeenCalled();
+    expect(
+      setCache.mock.calls.some(([key]) => String(key) === "twitter/tweets/123"),
+    ).toBe(false);
   });
 
   it("does not let a delayed account A receipt overwrite account B's cursor", async () => {
@@ -96,6 +97,7 @@ describe("sendTweet", () => {
     } as unknown as ClientBase["twitterClient"];
     client.withAuthenticatedSession = async (operation) =>
       operation({ client: {} as never, profile: accountA, revision: 1 });
+    client.isAuthenticatedSessionCurrent = () => true;
 
     const pending = sendTweet(client, "sent by A");
     await vi.waitFor(() =>
@@ -139,5 +141,110 @@ describe("sendTweet", () => {
     client.recordLatestCheckedTweetId("account-a", 101n);
 
     expect(client.getLatestCheckedTweetId("account-a")).toBe(102n);
+  });
+
+  it("keeps a chunked thread on one captured session and captured profile", async () => {
+    const runtime = {
+      agentId: "00000000-0000-0000-0000-000000000001" as UUID,
+      character: { name: "Agent" },
+      getSetting: () => undefined,
+      getCache: vi.fn(async () => undefined),
+      setCache: vi.fn(async () => undefined),
+      reportError: vi.fn(),
+    } as unknown as IAgentRuntime;
+    const client = new ClientBase(runtime, {} as TwitterClientState);
+    const capturedProfile = {
+      ...profile("account-a"),
+      username: "captured-a",
+    };
+    const session = {
+      client: {} as never,
+      profile: capturedProfile,
+      revision: 1,
+    };
+    let activeSession = false;
+    let rootSessionCount = 0;
+    client.withAuthenticatedSession = async (operation) => {
+      if (activeSession) return operation(session);
+      rootSessionCount += 1;
+      activeSession = true;
+      try {
+        return await operation(session);
+      } finally {
+        activeSession = false;
+      }
+    };
+    client.isAuthenticatedSessionCurrent = () => true;
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce({ data: { data: { id: "201", text: "first" } } })
+      .mockResolvedValueOnce({ data: { data: { id: "202", text: "second" } } });
+    client.twitterClient = {
+      sendTweet: send,
+    } as unknown as ClientBase["twitterClient"];
+
+    const memories = await sendChunkedTweet(
+      client,
+      { text: `${"a".repeat(280)}\n\n${"b".repeat(20)}` },
+      "00000000-0000-0000-0000-000000000002" as UUID,
+      "stale-caller-username",
+      "parent",
+    );
+
+    expect(rootSessionCount).toBe(1);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[0]?.[1]).toBe("parent");
+    expect(send.mock.calls[1]?.[1]).toBe("201");
+    expect(memories.map((memory) => memory.content.url)).toEqual([
+      "https://x.com/captured-a/status/201",
+      "https://x.com/captured-a/status/202",
+    ]);
+  });
+
+  it("aborts a chunked thread before another egress when its captured session rotates", async () => {
+    const runtime = {
+      agentId: "00000000-0000-0000-0000-000000000001" as UUID,
+      character: { name: "Agent" },
+      getSetting: () => undefined,
+      getCache: vi.fn(async () => undefined),
+      setCache: vi.fn(async () => undefined),
+      reportError: vi.fn(),
+    } as unknown as IAgentRuntime;
+    const client = new ClientBase(runtime, {} as TwitterClientState);
+    const session = {
+      client: {} as never,
+      profile: profile("account-a"),
+      revision: 1,
+    };
+    let activeSession = false;
+    client.withAuthenticatedSession = async (operation) => {
+      if (activeSession) return operation(session);
+      activeSession = true;
+      try {
+        return await operation(session);
+      } finally {
+        activeSession = false;
+      }
+    };
+    let current = true;
+    client.isAuthenticatedSessionCurrent = () => current;
+    const send = vi.fn(async () => {
+      current = false;
+      return { data: { data: { id: "301", text: "first" } } };
+    });
+    client.twitterClient = {
+      sendTweet: send,
+    } as unknown as ClientBase["twitterClient"];
+
+    await expect(
+      sendChunkedTweet(
+        client,
+        { text: `${"a".repeat(280)}\n\n${"b".repeat(20)}` },
+        "00000000-0000-0000-0000-000000000002" as UUID,
+        "account-b",
+        "parent",
+      ),
+    ).rejects.toMatchObject({ code: "X_AUTH_SESSION_ROTATED" });
+    expect(send).toHaveBeenCalledTimes(1);
   });
 });

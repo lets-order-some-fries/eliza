@@ -11,6 +11,7 @@ import { TwitterTimelineClient } from "./timeline";
 import type { TwitterClientState } from "./types";
 
 function makeClient(overrides: Record<string, unknown> = {}): ClientBase {
+  const identityCache = new Map<string, unknown>();
   const client = {
     twitterClient: {} as Client,
     accountId: "default",
@@ -23,6 +24,17 @@ function makeClient(overrides: Record<string, unknown> = {}): ClientBase {
       nicknames: [],
     }),
     isAuthenticatedSessionCurrent: () => true,
+    identityCacheKey: (profile: { id: string }, suffix: string) =>
+      `twitter/default/${profile.id}/${suffix}`,
+    getIdentityCache: async (profile: { id: string }, suffix: string) =>
+      identityCache.get(`twitter/default/${profile.id}/${suffix}`),
+    setIdentityCache: async (
+      profile: { id: string },
+      suffix: string,
+      value: unknown,
+    ) => {
+      identityCache.set(`twitter/default/${profile.id}/${suffix}`, value);
+    },
     ...overrides,
   } as unknown as ClientBase;
   if (!("withAuthenticatedSession" in overrides)) {
@@ -364,4 +376,49 @@ describe("TwitterTimelineClient.handleTimeline", () => {
     });
     expect(likeTweet).not.toHaveBeenCalled();
   });
+
+  it("does not replay an accepted action when source-memory persistence fails", async () => {
+    const profile = {
+      id: "account-a",
+      username: "account-a",
+      screenName: "Account A",
+      bio: "",
+      nicknames: [],
+    };
+    const likeTweet = vi.fn(async () => undefined);
+    const twitterClient = {
+      fetchHomeTimeline: vi.fn(async () => [
+        makeTweet({ id: "candidate", userId: "person-1" }),
+      ]),
+      likeTweet,
+    };
+    const session = { client: twitterClient as never, profile, revision: 1 };
+    const runtime = actionRuntime({
+      createMemory: vi.fn(async () => {
+        throw new Error("source receipt unavailable");
+      }),
+      deleteCache: vi.fn(async () => true),
+    });
+    const client = makeClient({
+      twitterClient,
+      withAuthenticatedSession: async (
+        operation: (captured: typeof session) => Promise<unknown>,
+      ) => operation(session),
+      isAuthenticatedSessionCurrent: () => true,
+    });
+    const timeline = new TwitterTimelineClient(
+      client,
+      runtime,
+      {} as TwitterClientState,
+    );
+
+    await expect(timeline.handleTimeline()).rejects.toMatchObject({
+      code: "X_TIMELINE_ACTION_FAILED",
+    });
+    await expect(timeline.handleTimeline()).rejects.toMatchObject({
+      code: "X_TIMELINE_ACTION_FAILED",
+    });
+
+    expect(likeTweet).toHaveBeenCalledOnce();
+  }, 15_000);
 });

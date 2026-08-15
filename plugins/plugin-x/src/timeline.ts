@@ -27,6 +27,7 @@ import {
 } from "./templates";
 import type { ActionResponse, TwitterClientState } from "./types";
 import { parseActionResponseFromText, sendTweet } from "./utils";
+import { executeSettledXAction } from "./utils/action-settlement";
 import {
   buildTwitterMessageMetadata,
   createMemorySafe,
@@ -99,7 +100,10 @@ function errorMessage(error: unknown): string {
 }
 
 function isSessionRotation(error: unknown): boolean {
-  return error instanceof ElizaError && error.code === "X_AUTH_SESSION_ROTATED";
+  return (
+    error instanceof ElizaError &&
+    ["X_AUTH_NOT_INITIALIZED", "X_AUTH_SESSION_ROTATED"].includes(error.code)
+  );
 }
 
 /**
@@ -502,8 +506,6 @@ Choose any combination of [LIKE], [RETWEET], [QUOTE], and [REPLY] that are appro
         createdAt: tweet.timestamp,
       };
 
-      await createMemorySafe(this.runtime, tweetMemory, "messages");
-
       try {
         // ensure world and rooms, connections, and worlds are created
         const userId = tweet.userId;
@@ -514,33 +516,43 @@ Choose any combination of [LIKE], [RETWEET], [QUOTE], and [REPLY] that are appro
 
         if (actionResponse.like) {
           this.assertCurrentSession(session);
-          await this.handleLikeAction(tweet);
-          executedActions.push("like");
+          if (await this.handleLikeAction(tweet, session)) {
+            executedActions.push("like");
+          }
         }
 
         if (actionResponse.retweet) {
           this.assertCurrentSession(session);
-          await this.handleRetweetAction(tweet);
-          executedActions.push("retweet");
+          if (await this.handleRetweetAction(tweet, session)) {
+            executedActions.push("retweet");
+          }
         }
 
         if (actionResponse.quote) {
-          await this.handleQuoteAction(tweet, mediaDescriptions, session);
-          executedActions.push("quote");
+          if (await this.handleQuoteAction(tweet, mediaDescriptions, session)) {
+            executedActions.push("quote");
+          }
         }
 
         if (actionResponse.reply) {
-          await this.handleReplyAction(tweet, mediaDescriptions, session);
-          executedActions.push("reply");
+          if (await this.handleReplyAction(tweet, mediaDescriptions, session)) {
+            executedActions.push("reply");
+          }
         }
 
+        if (executedActions.length > 0) {
+          await createMemorySafe(this.runtime, tweetMemory, "messages");
+        }
         results.push({ tweetId: tweet.id, actionResponse, executedActions });
       } catch (error) {
         if (isSessionRotation(error)) throw error;
-        logger.error(
-          `Error processing actions for tweet ${tweet.id}:`,
-          errorMessage(error),
-        );
+        // error-policy:J2 The scheduled-loop boundary reports the failed cycle;
+        // retain the tweet identity instead of fabricating a partial success.
+        throw new ElizaError("X timeline action failed", {
+          code: "X_TIMELINE_ACTION_FAILED",
+          cause: error,
+          context: { tweetId: tweet.id },
+        });
       }
     }
 
@@ -562,55 +574,76 @@ Choose any combination of [LIKE], [RETWEET], [QUOTE], and [REPLY] that are appro
     _worldId: UUID,
     _entityId: UUID,
   ) {
-    try {
-      // Use the utility function for consistency
-      await ensureTwitterContext(this.runtime, {
-        accountId: this.client.accountId,
-        userId: tweet.userId,
-        username: tweet.username,
-        name: tweet.name,
-        conversationId: tweet.conversationId,
+    await ensureTwitterContext(this.runtime, {
+      accountId: this.client.accountId,
+      userId: tweet.userId,
+      username: tweet.username,
+      name: tweet.name,
+      conversationId: tweet.conversationId,
+    });
+  }
+
+  async handleLikeAction(
+    tweet: ActionableTweet,
+    session?: TwitterAccountSession,
+  ): Promise<boolean> {
+    if (this.isDryRun) {
+      logger.log(`[DRY RUN] Would have liked tweet ${tweet.id}`);
+      return true;
+    }
+    if (session) {
+      await executeSettledXAction({
+        client: this.client,
+        session,
+        suffix: `timeline_action/${tweet.id}/like`,
+        operation: () => this.twitterClient.likeTweet(tweet.id),
+        scope: "XTimeline.actionSettlement",
+        context: {
+          accountId: this.client.accountId,
+          tweetId: tweet.id,
+          action: "like",
+        },
       });
-    } catch (error) {
-      logger.error(
-        `Failed to ensure context for tweet ${tweet.id}:`,
-        errorMessage(error),
-      );
-      // Don't fail the entire timeline processing
-    }
-  }
-
-  async handleLikeAction(tweet: ActionableTweet) {
-    try {
-      if (this.isDryRun) {
-        logger.log(`[DRY RUN] Would have liked tweet ${tweet.id}`);
-        return;
-      }
+    } else {
       await this.twitterClient.likeTweet(tweet.id);
-      logger.log(`Liked tweet ${tweet.id}`);
-    } catch (error) {
-      logger.error(`Error liking tweet ${tweet.id}:`, errorMessage(error));
     }
+    logger.log(`Liked tweet ${tweet.id}`);
+    return true;
   }
 
-  async handleRetweetAction(tweet: ActionableTweet) {
-    try {
-      if (this.isDryRun) {
-        logger.log(`[DRY RUN] Would have retweeted tweet ${tweet.id}`);
-        return;
-      }
-      await this.twitterClient.retweet(tweet.id);
-      logger.log(`Retweeted tweet ${tweet.id}`);
-    } catch (error) {
-      logger.error(`Error retweeting tweet ${tweet.id}:`, errorMessage(error));
+  async handleRetweetAction(
+    tweet: ActionableTweet,
+    session?: TwitterAccountSession,
+  ): Promise<boolean> {
+    if (this.isDryRun) {
+      logger.log(`[DRY RUN] Would have retweeted tweet ${tweet.id}`);
+      return true;
     }
+    if (session) {
+      await executeSettledXAction({
+        client: this.client,
+        session,
+        suffix: `timeline_action/${tweet.id}/retweet`,
+        operation: () => this.twitterClient.retweet(tweet.id),
+        scope: "XTimeline.actionSettlement",
+        context: {
+          accountId: this.client.accountId,
+          tweetId: tweet.id,
+          action: "retweet",
+        },
+      });
+    } else {
+      await this.twitterClient.retweet(tweet.id);
+    }
+    logger.log(`Retweeted tweet ${tweet.id}`);
+    return true;
   }
 
   async handleQuoteAction(
     tweet: ActionableTweet,
     mediaDescriptions: string = "",
     session?: TwitterAccountSession,
-  ) {
+  ): Promise<boolean> {
     try {
       const message = this.formMessage(this.runtime, tweet);
 
@@ -641,71 +674,105 @@ ${tweet.text}${mediaDescriptions}`;
           logger.log(
             `[DRY RUN] Would have quoted tweet ${tweet.id} with: ${responseObject.post}`,
           );
-          return;
+          return true;
         }
 
-        const result = await this.client.requestQueue.add(async () => {
-          if (session) this.assertCurrentSession(session);
-          return await this.twitterClient.sendQuoteTweet(
-            String(responseObject.post),
-            tweet.id,
-          );
-        });
+        const sendQuote = () =>
+          this.client.requestQueue.add(async () => {
+            if (session) this.assertCurrentSession(session);
+            return await this.twitterClient.sendQuoteTweet(
+              String(responseObject.post),
+              tweet.id,
+            );
+          });
+        const settlement = session
+          ? await executeSettledXAction({
+              client: this.client,
+              session,
+              suffix: `timeline_action/${tweet.id}/quote`,
+              operation: sendQuote,
+              scope: "XTimeline.actionSettlement",
+              context: {
+                accountId: this.client.accountId,
+                tweetId: tweet.id,
+                action: "quote",
+              },
+            })
+          : { executed: true as const, value: await sendQuote() };
+        if (!settlement.executed) {
+          return true;
+        }
+        const result = settlement.value;
 
-        const resultWithJson = result as { json: () => Promise<unknown> };
-        const body = (await resultWithJson.json()) as {
-          id?: string;
-          data?: {
+        try {
+          const resultWithJson = result as { json: () => Promise<unknown> };
+          const body = (await resultWithJson.json()) as {
             id?: string;
-            create_tweet?: {
-              tweet_results?: { result?: { id?: string } };
+            data?: {
+              id?: string;
+              create_tweet?: {
+                tweet_results?: { result?: { id?: string } };
+              };
             };
-          };
-        } | null;
-
-        const tweetResult =
-          body?.data?.create_tweet?.tweet_results?.result || body?.data || body;
-        if (tweetResult) {
+          } | null;
+          const tweetResult =
+            body?.data?.create_tweet?.tweet_results?.result ||
+            body?.data ||
+            body;
+          const tweetId = tweetResult?.id;
+          if (!tweetId) {
+            throw new ElizaError("X returned no usable quote-tweet receipt", {
+              code: "X_POST_RESPONSE_INVALID",
+            });
+          }
           logger.log("Successfully posted quote tweet");
-        } else {
-          logger.error("Quote tweet creation failed:", JSON.stringify(body));
-        }
-
-        // Create memory for our response
-        const tweetId = tweetResult?.id || Date.now().toString();
-        const responseId = createUniqueUuid(this.runtime, tweetId);
-        const responseMemory: Memory = {
-          id: responseId,
-          entityId: this.runtime.agentId,
-          agentId: this.runtime.agentId,
-          roomId: message.roomId,
-          content: {
-            ...responseObject,
-            source: "twitter",
-            inReplyTo: message.id,
-          },
-          metadata: {
-            type: "message",
-            source: "twitter",
-            accountId: this.client.accountId,
-            provider: "twitter",
-            fromBot: true,
-            messageIdFull: tweetId,
-            twitter: {
-              accountId: this.client.accountId,
-              tweetId,
-              inReplyTo: tweet.id,
+          const responseMemory: Memory = {
+            id: createUniqueUuid(this.runtime, tweetId),
+            entityId: this.runtime.agentId,
+            agentId: this.runtime.agentId,
+            roomId: message.roomId,
+            content: {
+              ...responseObject,
+              source: "twitter",
+              inReplyTo: message.id,
             },
-          } satisfies Memory["metadata"],
-          createdAt: Date.now(),
-        };
-
-        // Save the response to memory with error handling
-        await createMemorySafe(this.runtime, responseMemory, "messages");
+            metadata: {
+              type: "message",
+              source: "twitter",
+              accountId: this.client.accountId,
+              provider: "twitter",
+              fromBot: true,
+              messageIdFull: tweetId,
+              twitter: {
+                accountId: this.client.accountId,
+                tweetId,
+                inReplyTo: tweet.id,
+              },
+            } satisfies Memory["metadata"],
+            createdAt: Date.now(),
+          };
+          await createMemorySafe(this.runtime, responseMemory, "messages");
+        } catch (error) {
+          // error-policy:J7 X already accepted the quote, so replaying the
+          // action would duplicate an external effect. Report receipt loss and
+          // settle the source tweet as processed.
+          this.runtime.reportError("XTimeline.quoteReceipt", error, {
+            accountId: this.client.accountId,
+            tweetId: tweet.id,
+          });
+        }
+        return true;
       }
+      return false;
     } catch (error) {
       if (isSessionRotation(error)) throw error;
-      logger.error("Error in quote tweet generation:", errorMessage(error));
+      // error-policy:J2 The scheduled-loop boundary reports model and provider
+      // failures; returning false would mislabel a broken action as IGNORE.
+      throw new ElizaError("X quote-tweet action failed", {
+        code: "X_TIMELINE_ACTION_FAILED",
+        cause: error,
+        context: { tweetId: tweet.id },
+      });
     }
   }
 
@@ -713,7 +780,7 @@ ${tweet.text}${mediaDescriptions}`;
     tweet: ActionableTweet,
     mediaDescriptions: string = "",
     session?: TwitterAccountSession,
-  ) {
+  ): Promise<boolean> {
     try {
       const message = this.formMessage(this.runtime, tweet);
 
@@ -744,55 +811,82 @@ ${tweet.text}${mediaDescriptions}`;
           logger.log(
             `[DRY RUN] Would have replied to tweet ${tweet.id} with: ${responseObject.post}`,
           );
-          return;
+          return true;
         }
 
-        if (session) this.assertCurrentSession(session);
-        const result = await sendTweet(
-          this.client,
-          String(responseObject.post),
-          [],
-          tweet.id,
-        );
+        const sendReply = () =>
+          sendTweet(this.client, String(responseObject.post), [], tweet.id);
+        const settlement = session
+          ? await executeSettledXAction({
+              client: this.client,
+              session,
+              suffix: `timeline_action/${tweet.id}/reply`,
+              operation: sendReply,
+              scope: "XTimeline.actionSettlement",
+              context: {
+                accountId: this.client.accountId,
+                tweetId: tweet.id,
+                action: "reply",
+              },
+            })
+          : { executed: true as const, value: await sendReply() };
+        if (!settlement.executed) {
+          return true;
+        }
+        const result = settlement.value;
 
         if (result) {
           logger.log("Successfully posted reply tweet");
 
-          // Create memory for our response
-          const responseId = createUniqueUuid(this.runtime, result.id);
-          const responseMemory: Memory = {
-            id: responseId,
-            entityId: this.runtime.agentId,
-            agentId: this.runtime.agentId,
-            roomId: message.roomId,
-            content: {
-              ...responseObject,
-              source: "twitter",
-              inReplyTo: message.id,
-            },
-            metadata: {
-              type: "message",
-              source: "twitter",
-              accountId: this.client.accountId,
-              provider: "twitter",
-              fromBot: true,
-              messageIdFull: result.id,
-              twitter: {
-                accountId: this.client.accountId,
-                tweetId: result.id,
-                inReplyTo: tweet.id,
+          try {
+            const responseMemory: Memory = {
+              id: createUniqueUuid(this.runtime, result.id),
+              entityId: this.runtime.agentId,
+              agentId: this.runtime.agentId,
+              roomId: message.roomId,
+              content: {
+                ...responseObject,
+                source: "twitter",
+                inReplyTo: message.id,
               },
-            } satisfies Memory["metadata"],
-            createdAt: Date.now(),
-          };
-
-          // Save the response to memory with error handling
-          await createMemorySafe(this.runtime, responseMemory, "messages");
+              metadata: {
+                type: "message",
+                source: "twitter",
+                accountId: this.client.accountId,
+                provider: "twitter",
+                fromBot: true,
+                messageIdFull: result.id,
+                twitter: {
+                  accountId: this.client.accountId,
+                  tweetId: result.id,
+                  inReplyTo: tweet.id,
+                },
+              } satisfies Memory["metadata"],
+              createdAt: Date.now(),
+            };
+            await createMemorySafe(this.runtime, responseMemory, "messages");
+          } catch (error) {
+            // error-policy:J7 X already accepted the reply; surface local
+            // receipt loss without turning a successful egress into a retry.
+            this.runtime.reportError("XTimeline.replyReceipt", error, {
+              accountId: this.client.accountId,
+              tweetId: tweet.id,
+              replyId: result.id,
+            });
+          }
+          return true;
         }
       }
+      return false;
     } catch (error) {
       if (isSessionRotation(error)) throw error;
-      logger.error("Error in reply tweet generation:", errorMessage(error));
+      // error-policy:J2 The scheduled-loop boundary reports model and provider
+      // failures; returning false would mislabel a broken action as IGNORE.
+      throw new ElizaError("X reply action failed", {
+        code: "X_TIMELINE_ACTION_FAILED",
+        cause: error,
+        context: { tweetId: tweet.id },
+      });
     }
   }
 }

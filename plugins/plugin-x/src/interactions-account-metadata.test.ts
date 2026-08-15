@@ -38,6 +38,7 @@ function createRuntime(settings: Record<string, string> = {}) {
 
 function createClient(accountId = "secondary"): ClientBase {
   let lastCheckedTweetId: bigint | null = null;
+  const identityCache = new Map<string, unknown>();
   const authenticatedProfile = {
     id: "bot-user",
     username: "bot",
@@ -69,6 +70,20 @@ function createClient(accountId = "secondary"): ClientBase {
           profile: await client.getAuthenticatedProfile(),
           revision: 1,
         }),
+    ),
+    isAuthenticatedSessionCurrent: vi.fn(() => true),
+    identityCacheKey: (profile: { id: string }, suffix: string) =>
+      `twitter/${accountId}/${profile.id}/${suffix}`,
+    getIdentityCache: vi.fn(async (profile: { id: string }, suffix: string) =>
+      identityCache.get(`twitter/${accountId}/${profile.id}/${suffix}`),
+    ),
+    setIdentityCache: vi.fn(
+      async (profile: { id: string }, suffix: string, value: unknown) => {
+        identityCache.set(
+          `twitter/${accountId}/${profile.id}/${suffix}`,
+          value,
+        );
+      },
     ),
     getLatestCheckedTweetId: vi.fn(() => lastCheckedTweetId),
     recordLatestCheckedTweetId: vi.fn((_profileId: string, id: bigint) => {
