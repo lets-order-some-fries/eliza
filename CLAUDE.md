@@ -59,8 +59,8 @@ plugin is the deliberate exception because it reimplements the 1966 chatbot.
 ## Root commands
 
 ```bash
-bun install            # install workspaces, prepare submodules, apply patches, sync artifacts
-bun run install:light  # install without the large artifact sync
+bun install            # install workspaces, prepare submodules, apply patches
+bun run install:light  # alias of bun install (retained for muscle memory)
 bun run dev            # start the API and Eliza app development UI
 bun run start          # start the standalone agent host
 bun run build          # build the workspace through Turbo

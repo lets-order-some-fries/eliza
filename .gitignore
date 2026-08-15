@@ -790,9 +790,8 @@ plugins/plugin-local-inference/native/stable-diffusion.cpp/
 **/zig-out/
 waifu.fun/
 
-# --- synced artifacts (stripped for fast clones; pulled on install by
-#     packages/scripts/sync-artifacts.mjs from elizaOS/eliza-archive) ---
-/.eliza-artifacts-version
+# --- archived artifacts (stripped for fast clones; available on demand via
+#     packages/scripts/fetch-archive-artifacts.mjs, extracted out-of-tree) ---
 /packages/shared/assets-classic/background/Clouds_Loop_HQ_1080p.mp4
 /packages/app-core/platforms/ios/App/App/Assets.xcassets/Splash.imageset/splash-2732x2732-1.png
 /packages/app-core/platforms/ios/App/App/Assets.xcassets/Splash.imageset/splash-2732x2732-2.png
